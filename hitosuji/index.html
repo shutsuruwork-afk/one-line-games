@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ひとすじ</title>
+<meta name="description" content="一本の線だけでできたゲーム。線を弾いて、とげと穴を越えていく。">
+<style>
+  :root { --bg: #f3efe6; --ink: #1d1c1a; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #141413; --ink: #ece8de; }
+  }
+  :root[data-theme="dark"] { --bg: #141413; --ink: #ece8de; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" role="img" aria-label="ひとすじ。画面にあるのは一本の線だけ。スペースキー、上キー、またはタップで線を弾いてジャンプ。長押しで高く跳ぶ。"></canvas>
+<noscript>このゲームは JavaScript が必要です。</noscript>
+<script>
+(() => {
+  'use strict';
+
+  // ------------------------------------------------------------------
+  // 画面
+  // ------------------------------------------------------------------
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1, S = 1, baseY = 0, ink = '#1d1c1a';
+
+  function readInk() {
+    ink = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#1d1c1a';
+  }
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    S = Math.max(0.45, Math.min(H / 360, W / 620)); // world unit -> css px
+    baseY = H * 0.62;
+    readInk();
+  }
+  addEventListener('resize', resize);
+  try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readInk); } catch (e) {}
+  resize();
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  };
+
+  // ------------------------------------------------------------------
+  // 音（線を弾く音）
+  // ------------------------------------------------------------------
+  let actx = null, muted = store.get('hitosuji-muted') === '1';
+  function ensureAudio() {
+    if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+  function pluck(freq, dur, vol, type, bend) {
+    if (!actx || muted) return;
+    const t = actx.currentTime;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'triangle';
+    o.frequency.setValueAtTime(freq, t);
+    o.frequency.exponentialRampToValueAtTime(freq * (bend || 0.985), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(actx.destination);
+    o.start(t); o.stop(t + dur + 0.03);
+  }
+
+  // ------------------------------------------------------------------
+  // 定数（ワールド単位、高さは上が正）
+  // ------------------------------------------------------------------
+  const DOME_R = 13, DOME_H = 16;   // プレイヤー（線のふくらみ）
+  const FOOT = 9;                    // 足場判定の半幅
+  const FOOT_SPIKE = 6;              // とげ判定の半幅（少し甘め）
+  const JUMP_V = 650;
+  const G_HOLD = 1500, G_RISE = 3600, G_FALL = 3000;
+  const PIT = 3000;
+  const STEP_UP = 5;                 // これ以下の段差はよじ登れる
+
+  // ------------------------------------------------------------------
+  // 状態
+  // ------------------------------------------------------------------
+  let pts, genX;
+  let px, b, vy, onGround, holding, coyote, buffer, hopTimer;
+  let dist, speed, score, best = +(store.get('hitosuji-best') || 0), newBest;
+  let state = 'title', tState = 0, squash = 0, deathX = 0, lastMilestone = 0;
+
+  function reset() {
+    pts = [{ x: -4000, h: 0 }, { x: 900, h: 0 }];
+    genX = 900;
+    px = 0; b = 0; vy = 0; onGround = true; holding = false;
+    coyote = 0; buffer = 0; hopTimer = 0.9;
+    dist = 0; speed = 260; score = 0; newBest = false; squash = 0; lastMilestone = 0;
+  }
+  reset();
+
+  // ------------------------------------------------------------------
+  // 地形：折れ線。水平な面は安全、斜めの面（とげ）は危険。
+  // ------------------------------------------------------------------
+  const rnd = Math.random;
+  function add(x, h) { pts.push({ x, h }); }
+
+  function generate() {
+    const lvl = Math.min(1, dist / 14000);
+    const gap = speed * (0.55 + rnd() * 0.7) * (1 - 0.25 * lvl) + 40;
+    let x = genX + gap;
+    add(x, 0);
+    const r = rnd();
+    if (r < 0.36) {                       // とげ（1〜3本）
+      let n = 1;
+      if (rnd() < 0.25 + 0.4 * lvl) n++;
+      if (rnd() < 0.05 + 0.2 * lvl) n++;
+      for (let i = 0; i < n; i++) {
+        const w = 26, h = 32 + rnd() * 14;
+        add(x + w / 2, h); x += w; add(x, 0);
+      }
+    } else if (r < 0.6) {                 // 台（ときどき上にとげ）
+      const h = 30 + rnd() * (35 + 20 * lvl), w = 80 + rnd() * 160;
+      add(x, h);
+      if (w > 170 && rnd() < 0.25 + 0.5 * lvl) {
+        const m = x + w * 0.55 - 13;
+        add(m, h); add(m + 13, h + 34); add(m + 26, h);
+      }
+      x += w; add(x, h); add(x, 0);
+    } else if (r < 0.83) {                // 穴
+      const w = Math.min(70 + rnd() * speed * 0.35, speed * 0.5);
+      add(x, -PIT); x += w; add(x, -PIT); add(x, 0);
+    } else {                              // 階段
+      const h1 = 35 + rnd() * 20, h2 = h1 + 40 + rnd() * 25 * (0.5 + lvl);
+      const w1 = 70 + rnd() * 50, w2 = 90 + rnd() * 80;
+      add(x, h1); x += w1; add(x, h1); add(x, h2); x += w2; add(x, h2); add(x, 0);
+    }
+    genX = x;
+  }
+
+  function findSeg(x) {
+    let lo = 0, hi = pts.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (pts[m].x <= x) lo = m; else hi = m; }
+    return lo;
+  }
+  function lerpSeg(a, c, x) {
+    return c.x === a.x ? c.h : a.h + (c.h - a.h) * (x - a.x) / (c.x - a.x);
+  }
+
+  // 'dead' / 着地する高さ / null
+  function collide(prevB) {
+    const L = px - FOOT, R = px + FOOT;
+    let land = null;
+    for (let i = findSeg(L); i < pts.length - 1; i++) {
+      const a = pts[i], c = pts[i + 1];
+      if (a.x >= R) break;
+      if (c.x <= L || c.x === a.x) continue;
+      if (a.h === c.h) {
+        if (a.h > b) {
+          if (a.h <= prevB + STEP_UP) land = land === null ? a.h : Math.max(land, a.h);
+          else return 'dead';
+        }
+      } else {
+        const l2 = Math.max(a.x, px - FOOT_SPIKE), r2 = Math.min(c.x, px + FOOT_SPIKE);
+        if (r2 <= l2) continue;
+        if (Math.max(lerpSeg(a, c, l2), lerpSeg(a, c, r2)) > b + 1) return 'dead';
+      }
+    }
+    return land;
+  }
+
+  // ------------------------------------------------------------------
+  // 物理
+  // ------------------------------------------------------------------
+  function tryJump() {
+    if (buffer > 0 && (onGround || coyote > 0)) {
+      vy = JUMP_V; onGround = false; coyote = 0; buffer = 0;
+      pluck(196 * Math.pow(2, (b / 40) / 12 * 5), 0.35, 0.13, 'triangle', 0.99);
+    }
+  }
+
+  function step(dt, vx) {
+    const prevB = b;
+    px += vx * dt; dist += vx * dt;
+    const g = vy > 0 ? (holding ? G_HOLD : G_RISE) : G_FALL;
+    vy -= g * dt; b += vy * dt;
+    const res = collide(prevB);
+    if (res === 'dead') { die(); return; }
+    if (res !== null && vy <= 0) {
+      if (!onGround && vy < -250) {
+        squash = Math.min(1, -vy / 900);
+        pluck(98, 0.09, 0.05, 'sine', 0.9);
+      }
+      b = res; vy = 0; onGround = true; coyote = 0.08;
+    } else {
+      onGround = false;
+    }
+    if (b < -(H - baseY) / S - 60) die();
+  }
+
+  function die() {
+    if (state !== 'play') return;
+    state = 'dead'; tState = 0; deathX = px;
+    holding = false;
+    if (score > best) { best = score; newBest = true; store.set('hitosuji-best', String(best)); }
+    pluck(82, 1.1, 0.2, 'triangle', 0.7);
+    pluck(123, 0.6, 0.07, 'sawtooth', 0.6);
+  }
+
+  function update(dt) {
+    tState += dt;
+    squash = Math.max(0, squash - dt * 5);
+    if (state === 'play') {
+      buffer -= dt;
+      if (!onGround) coyote -= dt;
+      const n = Math.max(1, Math.ceil(dt / (1 / 240))), h = dt / n;
+      for (let i = 0; i < n && state === 'play'; i++) { tryJump(); step(h, speed); }
+      speed = Math.min(560, 260 + dist * 0.011);
+      score = Math.floor(dist / 40);
+      if (score >= lastMilestone + 100) {
+        lastMilestone = score - (score % 100);
+        pluck(523, 0.5, 0.06, 'sine', 1); pluck(784, 0.6, 0.04, 'sine', 1);
+      }
+      while (genX < px + W / S + 300) generate();
+      const camX = px - 0.3 * W / S;
+      while (pts.length > 3 && pts[1].x < camX - 400) pts.shift();
+    } else if (state === 'title') {
+      hopTimer -= dt;
+      if (hopTimer <= 0 && onGround) { vy = JUMP_V * 0.72; onGround = false; hopTimer = 1.7; }
+      const n = Math.max(1, Math.ceil(dt / (1 / 240))), h = dt / n;
+      for (let i = 0; i < n; i++) step(h, 0);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 一筆書きの数字（左下から始まり右下で終わる）
+  // ------------------------------------------------------------------
+  const GLYPH = {
+    '0': [[0,0],[1,0],[1,1],[0,1],[0,0],[1,0]],
+    '1': [[0,0],[.55,0],[.55,1],[.25,.78],[.55,1],[.55,0],[1,0]],
+    '2': [[0,0],[0,.5],[1,.5],[1,1],[0,1],[1,1],[1,.5],[0,.5],[0,0],[1,0]],
+    '3': [[0,0],[1,0],[1,1],[0,1],[1,1],[1,.5],[.2,.5],[1,.5],[1,0]],
+    '4': [[0,0],[.75,0],[.75,1],[0,.35],[1,.35],[.75,.35],[.75,0],[1,0]],
+    '5': [[0,0],[1,0],[1,.5],[0,.5],[0,1],[1,1],[0,1],[0,.5],[1,.5],[1,0]],
+    '6': [[0,0],[1,0],[1,.5],[0,.5],[0,1],[1,1],[0,1],[0,0],[1,0]],
+    '7': [[0,0],[.3,0],[1,1],[0,1],[1,1],[.3,0],[1,0]],
+    '8': [[0,0],[1,0],[1,1],[0,1],[0,0],[0,.5],[1,.5],[1,0]],
+    '9': [[0,0],[1,0],[1,1],[0,1],[0,.5],[1,.5],[1,0]],
+  };
+
+  // ------------------------------------------------------------------
+  // 描画：毎フレーム、ちょうど一本の線だけを引く
+  // ------------------------------------------------------------------
+  const P = [];
+  function emitS(x, y) { P.push(x, y); }
+
+  const clamp = (v, a, z) => Math.max(a, Math.min(z, v));
+  const easeOutBack = t => { const c = 1.7; t -= 1; return 1 + (c + 1) * t * t * t + c * t * t; };
+
+  function buildLine() {
+    P.length = 0;
+    const camX = px - 0.3 * W / S;
+
+    // --- 線の左端：数字を書く ---
+    let text = '';
+    if (state === 'play' || state === 'dead') text = String(score);
+    else if (best > 0) text = String(best);
+
+    const small = clamp(13 * S, 12, 20);
+    let gh = small;
+    if (state === 'dead') {
+      const big = Math.min(clamp(H * 0.13, 30, 96), (W * 0.55) / Math.max(1, text.length));
+      gh = small + (big - small) * easeOutBack(clamp((tState - 0.35) / 0.55, 0, 1));
+    }
+    const gw = gh * 0.6, gap = gh * 0.4;
+    let cx = 16;
+    emitS(0, baseY);
+    for (let k = 0; k < text.length; k++) {
+      const g = GLYPH[text[k]];
+      const wob = (state === 'dead' && newBest) ? Math.sin(tState * 7 - k * 0.9) * gh * 0.07 : 0;
+      for (const [gx, gy] of g) emitS(cx + gx * gw, baseY - gy * gh + (gy > 0 ? wob : 0));
+      cx += gw + gap;
+    }
+    const regionEnd = text.length ? cx + gap : 16;
+
+    // --- 地形とプレイヤー（線を下から押し上げる「ふくらみ」） ---
+    const up = clamp(vy / JUMP_V, 0, 1);
+    const fade = state === 'dead' ? Math.max(0, 1 - tState * 2.2) : 1;
+    const dh = DOME_H * (1 + 0.35 * up - 0.45 * squash);
+    const dr = DOME_R * (1 - 0.15 * up + 0.35 * squash);
+    const slope = 2 * dh / dr;
+    const tent = x => {
+      const dx = Math.abs(x - px);
+      return dx < dr ? b + dh * (1 - (dx / dr) * (dx / dr)) : b - slope * (dx - dr);
+    };
+    const rippleOn = state === 'dead';
+    const emitW = (x, h) => {
+      let y = h + Math.max(0, tent(x) - h) * fade;
+      if (rippleOn) {
+        const dx = Math.abs(x - deathX);
+        y += 24 * Math.exp(-2.6 * tState) * Math.exp(-dx / 380) * Math.sin(dx * 0.05 - tState * 24);
+      }
+      emitS((x - camX) * S, Math.min(H + 40, baseY - y * S));
+    };
+
+    const xa = camX + regionEnd / S, xb = camX + W / S + 20;
+    const zone = dr + (Math.max(0, b) + (H - baseY) / S + 60) / slope;
+    const zl = px - zone, zr = px + zone, STEP = 1.5;
+    let i = findSeg(xa);
+    emitW(xa, lerpSeg(pts[i], pts[i + 1] || pts[i], xa));
+    let prevX = xa;
+    for (let j = i + 1; j < pts.length; j++) {
+      const a = pts[j - 1], p = pts[j];
+      const end = Math.min(p.x, xb);
+      if (p.x > a.x && fade > 0) {
+        const s0 = Math.max(prevX, zl), s1 = Math.min(end, zr);
+        if (s1 > s0) {
+          for (let t = px + Math.ceil((s0 - px) / STEP) * STEP; t < s1; t += STEP) {
+            if (t > prevX) emitW(t, lerpSeg(a, p, t));
+          }
+        }
+      }
+      if (p.x >= xb) { emitW(xb, lerpSeg(a, p, xb)); break; }
+      emitW(p.x, p.h);
+      prevX = p.x;
+    }
+  }
+
+  function draw() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    buildLine();
+    ctx.beginPath();
+    ctx.moveTo(P[0], P[1]);
+    for (let k = 2; k < P.length; k += 2) ctx.lineTo(P[k], P[k + 1]);
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = clamp(2.2 * S, 2, 4.5);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+
+  // ------------------------------------------------------------------
+  // 入力
+  // ------------------------------------------------------------------
+  function press() {
+    ensureAudio();
+    if (state === 'title') {
+      state = 'play'; tState = 0; holding = true; buffer = 0.12;
+    } else if (state === 'play') {
+      holding = true; buffer = 0.12;
+    } else if (state === 'dead' && tState > 0.8) {
+      reset(); state = 'play'; tState = 0; holding = true; buffer = 0;
+    }
+  }
+  function release() { holding = false; }
+
+  cv.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+  addEventListener('pointerup', release);
+  addEventListener('pointercancel', release);
+  addEventListener('blur', release);
+  const JUMP_KEYS = new Set([' ', 'Spacebar', 'ArrowUp', 'w', 'W', 'Enter']);
+  addEventListener('keydown', e => {
+    if (JUMP_KEYS.has(e.key)) { e.preventDefault(); if (!e.repeat) press(); }
+    else if (e.key === 'm' || e.key === 'M') { muted = !muted; store.set('hitosuji-muted', muted ? '1' : '0'); }
+  });
+  addEventListener('keyup', e => { if (JUMP_KEYS.has(e.key)) release(); });
+
+  // ------------------------------------------------------------------
+  // ループ
+  // ------------------------------------------------------------------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // テスト用の窓口
+  window.__hitosuji = {
+    get state() { return state; }, get score() { return score; },
+    get px() { return px; }, get b() { return b; }, get onGround() { return onGround; },
+    get pts() { return pts; }, get speed() { return speed; },
+    press, release,
+  };
+})();
+</script>
+</body>
+</html>
