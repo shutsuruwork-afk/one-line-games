@@ -6,17 +6,17 @@
 <title>ひとすじ</title>
 <meta name="description" content="一本の線だけでできたゲーム。線を弾いて、とげと穴を越えていく。">
 <style>
-  :root { --bg: #f3efe6; --ink: #1d1c1a; }
+  :root { --bg: #e9ebe6; --ink: #1a1c1f; }
   @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { --bg: #141413; --ink: #ece8de; }
+    :root:not([data-theme="light"]) { --bg: #121417; --ink: #e6e8e3; color-scheme: dark; }
   }
-  :root[data-theme="dark"] { --bg: #141413; --ink: #ece8de; }
+  :root[data-theme="dark"] { --bg: #121417; --ink: #e6e8e3; color-scheme: dark; }
   html, body {
     margin: 0; height: 100%; background: var(--bg); overflow: hidden;
     touch-action: none; -webkit-user-select: none; user-select: none;
     -webkit-tap-highlight-color: transparent;
   }
-  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; cursor: pointer; }
+  canvas { display: block; width: 100%; height: 100%; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -34,11 +34,11 @@
   let W = 0, H = 0, DPR = 1, S = 1, baseY = 0, ink = '#1d1c1a';
 
   function readInk() {
-    ink = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#1d1c1a';
+    ink = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || '#1a1c1f';
   }
   function resize() {
     DPR = Math.min(window.devicePixelRatio || 1, 2);
-    W = window.innerWidth; H = window.innerHeight;
+    W = cv.clientWidth || window.innerWidth; H = cv.clientHeight || window.innerHeight;
     cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
     S = Math.max(0.45, Math.min(H / 360, W / 620)); // world unit -> css px
     baseY = H * 0.62;
