@@ -1,0 +1,1062 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ひとすじ</title>
+<meta name="description" content="一本の線だけで描かれた、蜘蛛の糸のゲーム。">
+<style>
+/* Layout: one full-bleed canvas. The whole game is a single unbroken thread, like sashiko stitching on indigo cloth. */
+:root {
+  --cloth: #e6ecef;   /* 藍白 — indigo-washed cloth */
+  --thread: #1b2e4b;  /* 藍 — indigo thread */
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --cloth: #121c31; --thread: #ebe6d8; color-scheme: dark; }
+}
+:root[data-theme="dark"] { --cloth: #121c31; --thread: #ebe6d8; color-scheme: dark; }
+html { height: 100%; box-sizing: border-box; }
+body {
+  height: 100%; margin: 0; overflow: hidden;
+  background: var(--cloth); color: var(--thread);
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent; touch-action: none;
+}
+canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: pointer; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+</style>
+</head>
+<body>
+<canvas id="c" aria-describedby="how"></canvas>
+<p class="sr-only" id="how">ひとすじ。画面のすべてが一本の線で描かれたゲームです。押しているあいだ蜘蛛が斜め前の天井へ糸を張ってぶら下がり、離すと糸を放して飛びます。トゲとつららに触れるか、下へ落ちると終わりです。スペースキー、クリック、タッチで操作できます。Mキーで音を切り替えます。</p>
+<p class="sr-only" id="live" aria-live="polite"></p>
+<script>
+(() => {
+'use strict';
+
+/* ================================================================
+   ひとすじ — everything on screen is ONE polyline:
+   one beginPath, one moveTo, many lineTo, one stroke per frame.
+   Branches (the silk, the spider's legs, letters) are drawn
+   out-and-back along themselves, so the pen never lifts.
+   ================================================================ */
+
+// ---------- tuning ----------
+const VIEW_H = 600;          // world units visible vertically (landscape)
+const MIN_VIEW_W = 520;      // never show less than this horizontally
+// physics knobs live in one object so tests can probe them
+const TUNE = {
+  G: 1900,                   // gravity
+  KICK: 700,                 // push-off at the start of a run
+  PUMP: 320,                 // a hanging spider kicks forward while you hold
+  REEL: 28,                  // …and climbs its thread a little
+  DRAG: 0.0003,              // quadratic air drag
+  VMAX: 1150,
+  ANGLE: 62,                 // the thread is thrown this many degrees above forward
+};
+const ROPE_MAX = 330;        // reach of a thrown thread
+const ROPE_MIN = 64;
+const SHOT_SPEED = 3400;
+const BODY_R = 11;
+const DX = 8;                // ceiling sample spacing
+const UNIT = 40;             // world units per point
+const MARK_EVERY = 100;      // a milestone post every N points
+const CEIL0 = 150;           // height of calm ceiling
+const STEP = 1 / 240;
+const DEG = Math.PI / 180;
+
+// ---------- helpers ----------
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeInOut = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- single-stroke glyphs ----------
+// Cap height 1, y up, every glyph starts and ends on the baseline,
+// so a line of text is one connected stroke riding its baseline.
+const GLYPH = (() => {
+  const A = (cx, cy, rx, ry, a0, a1, n) => {
+    n = n || Math.max(6, Math.ceil(Math.abs(a1 - a0) / 12));
+    const o = [];
+    for (let i = 0; i <= n; i++) {
+      const a = (a0 + (a1 - a0) * i / n) * DEG;
+      o.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+    }
+    return o;
+  };
+  const rev = a => a.slice().reverse();
+  const g = {};
+  g['0'] = { w: 0.6, p: A(0.3, 0.5, 0.29, 0.5, -90, 270, 36) };
+  g['1'] = { w: 0.42, p: [[0.24, 0], [0.24, 1], [0.05, 0.8], [0.24, 1], [0.24, 0]] };
+  { const a = A(0.3, 0.7, 0.27, 0.28, 160, -38);
+    g['2'] = { w: 0.6, p: [[0.02, 0], ...rev(a), ...a, [0.02, 0], [0.6, 0]] }; }
+  { const up = A(0.28, 0.75, 0.23, 0.25, 150, -90),
+          la = A(0.29, 0.25, 0.28, 0.25, 90, -90), lb = A(0.29, 0.25, 0.28, 0.25, -90, -150);
+    g['3'] = { w: 0.58, p: [...lb, ...rev(lb), ...rev(la), ...rev(up), ...up, ...la] }; }
+  g['4'] = { w: 0.62, p: [[0.46, 0], [0.46, 1], [0, 0.32], [0.62, 0.32], [0.46, 0.32], [0.46, 0]] };
+  { const ba = A(0.3, 0.33, 0.29, 0.33, 140, -90), lb = A(0.3, 0.33, 0.29, 0.33, -90, -150);
+    g['5'] = { w: 0.6, p: [...lb, ...rev(lb), ...rev(ba), [0.1, 1], [0.56, 1], [0.1, 1], ...ba] }; }
+  { const big = A(0.32, 0.5, 0.3, 0.5, 55, 270), loop = A(0.31, 0.3, 0.29, 0.3, -90, 180);
+    g['6'] = { w: 0.62, p: [...rev(big), ...big, ...loop, ...rev(loop)] }; }
+  g['7'] = { w: 0.58, p: [[0.2, 0], [0.58, 1], [0, 1], [0.58, 1], [0.2, 0]] };
+  g['8'] = { w: 0.6, p: [...A(0.3, 0.26, 0.29, 0.26, -90, 90), ...A(0.3, 0.76, 0.23, 0.24, -90, -450, 36),
+                         ...A(0.3, 0.26, 0.29, 0.26, 90, 270)] };
+  g['9'] = { w: 0.6, p: [[0.42, 0], ...A(0.3, 0.7, 0.28, 0.3, -16, 344, 34), [0.42, 0]] };
+  g['B'] = { w: 0.6, p: [[0, 0], [0, 1], [0.3, 1], ...A(0.3, 0.76, 0.24, 0.24, 90, -90), [0, 0.52], [0.32, 0.52],
+                         ...A(0.32, 0.26, 0.28, 0.26, 90, -90), [0, 0], [0.6, 0]] };
+  g['D'] = { w: 0.64, p: [[0, 0], [0, 1], [0.22, 1], ...A(0.22, 0.5, 0.42, 0.5, 90, -90, 18), [0, 0], [0.64, 0]] };
+  { // a rounded E (ε), so it still reads when its foot rests on a line
+    const up = A(0.32, 0.75, 0.25, 0.25, 30, 270), la = A(0.32, 0.25, 0.29, 0.25, 90, 270), lb = A(0.32, 0.25, 0.29, 0.25, 270, 330);
+    g['E'] = { w: 0.6, p: [...lb, ...rev(lb), ...rev(la), ...rev(up), ...up, ...la] }; }
+  g['H'] = { w: 0.62, p: [[0, 0], [0, 1], [0, 0.52], [0.62, 0.52], [0.62, 1], [0.62, 0]] };
+  g['L'] = { w: 0.5, p: [[0, 0], [0, 1], [0, 0], [0.5, 0]] };
+  g['N'] = { w: 0.62, p: [[0, 0], [0, 1], [0.62, 0], [0.62, 1], [0.62, 0]] };
+  g['O'] = { w: 0.78, p: A(0.39, 0.5, 0.38, 0.5, -90, 270, 40) };
+  { const up = A(0.3, 0.75, 0.27, 0.25, 30, 270), la = A(0.3, 0.25, 0.29, 0.25, 90, -90),
+          lb = A(0.3, 0.25, 0.29, 0.25, -90, -150);
+    g['S'] = { w: 0.6, p: [...lb, ...rev(lb), ...rev(la), ...rev(up), ...up, ...la] }; }
+  g['T'] = { w: 0.6, p: [[0.3, 0], [0.3, 1], [0, 1], [0.6, 1], [0.3, 1], [0.3, 0]] };
+  g['W'] = { w: 0.86, p: [[0.2, 0], [0, 1], [0.2, 0], [0.43, 0.72], [0.66, 0], [0.86, 1], [0.66, 0]] };
+  g[' '] = { w: 0.34, p: [] };
+  return g;
+})();
+// Letters that hang from a line (the ceiling) instead of standing on one.
+const HANG = (() => {
+  const A = (cx, cy, rx, ry, a0, a1, n) => {
+    const o = [];
+    for (let i = 0; i <= n; i++) { const a = (a0 + (a1 - a0) * i / n) * DEG; o.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]); }
+    return o;
+  };
+  return {
+    H: { w: 0.62, p: [[0, 1], [0, 0], [0, 0.52], [0.62, 0.52], [0.62, 0], [0.62, 1]] },
+    O: { w: 0.78, p: A(0.39, 0.5, 0.38, 0.5, 90, 450, 40) },
+    L: { w: 0.5, p: [[0, 1], [0, 0], [0.5, 0], [0, 0], [0, 1], [0.5, 1]] },
+    D: { w: 0.64, p: [[0, 1], [0, 0], [0.22, 0], ...A(0.22, 0.5, 0.42, 0.5, -90, 90, 18), [0.64, 1]] },
+  };
+})();
+const GAP = 0.2; // spacing between glyphs, in cap heights
+
+function textWidth(str, size) {
+  let w = 0;
+  for (let i = 0; i < str.length; i++) { const gl = GLYPH[str[i]]; if (gl) w += gl.w + (i ? GAP : 0); }
+  return w * size;
+}
+// Appends to `out` (flat [x,y,...]) a stroke that starts at (x, base) and ends on the baseline at the far end.
+// `h` scales glyph height (0 = letters lie flat into their baseline).
+function textPts(out, str, x, base, size, h = 1) {
+  let ox = 0;
+  out.push(x, base);
+  for (let i = 0; i < str.length; i++) {
+    const gl = GLYPH[str[i]]; if (!gl) continue;
+    if (i) ox += GAP;
+    for (const [gx, gy] of gl.p) out.push(x + (ox + gx) * size, base - gy * size * h);
+    ox += gl.w;
+  }
+  out.push(x + ox * size, base);
+  return out;
+}
+
+// Hanging text: starts at (x, top) on the line it hangs from and ends on it at the far end.
+function hangPts(out, str, x, top, size, h = 1) {
+  let ox = 0;
+  out.push(x, top);
+  for (let i = 0; i < str.length; i++) {
+    const gl = HANG[str[i]]; if (!gl) continue;
+    if (i) ox += GAP;
+    for (const [gx, gy] of gl.p) out.push(x + (ox + gx) * size, top + (1 - gy) * size * h);
+    ox += gl.w;
+  }
+  out.push(x + ox * size, top);
+  return out;
+}
+
+// ---------- the title, written in connected kana (連綿), top to bottom ----------
+// 100×100 boxes, y down. The thread runs straight through all four characters.
+// [x, y, 1] marks a corner. Within a character, strokes that cross or touch are reached by
+// going out and back along a straight stroke, so no extra line shows inside a character.
+const KANA = [
+  // ひ
+  [[10, 27, 1], [30, 23, 1], [22, 40], [16, 56], [20, 71], [32, 82], [48, 82], [60, 70], [67, 52], [71, 33], [73, 20, 1], [79, 34], [85, 47], [89, 55, 1]],
+  // と
+  [[44, 2, 1], [47, 20], [50, 40, 1], [73, 29, 1], [50, 40, 1], [38, 50], [30, 62], [29, 77], [40, 87], [60, 90], [88, 86, 1]],
+  // す
+  [[52, 4, 1], [52, 29, 1], [7, 31, 1], [52, 29, 1], [93, 26, 1], [52, 29, 1], [52, 42], [47, 52], [40, 56], [35, 50], [38, 42], [46, 41], [52, 48], [55, 58], [53, 72], [47, 84], [40, 94, 1]],
+  // じ  (濁点 first, right to left, then し, which leaves toward the spider)
+  [[81, 4, 1], [86, 19, 1], [65, 9, 1], [70, 23, 1], [30, 9, 1], [30, 36], [30, 60], [34, 76], [44, 86], [58, 87], [70, 80], [79, 67, 1]],
+];
+const KANA_SIZE = 64, KANA_GAP = 12;
+
+function catmull(src, per) {
+  const pts = [];
+  for (const p of src) { pts.push(p); if (p[2]) pts.push(p); }   // corners: repeat the point
+  const out = [];
+  const P = i => pts[clamp(i, 0, pts.length - 1)];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+    if (p1[0] === p2[0] && p1[1] === p2[1]) continue;
+    for (let k = 0; k < per; k++) {
+      const t = k / per, t2 = t * t, t3 = t2 * t;
+      out.push([
+        0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+        0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
+      ]);
+    }
+  }
+  out.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+  return out;
+}
+// The written column in world space. Its first point sits right under the anchor x = ax.
+function kanaColumn(ax, top) {
+  const ctrl = [];
+  const left = ax - KANA[0][0][0] / 100 * KANA_SIZE;
+  KANA.forEach((ch, k) => {
+    const oy = top + k * (KANA_SIZE + KANA_GAP);
+    for (const [x, y, c] of ch) ctrl.push([left + x / 100 * KANA_SIZE, oy + y / 100 * KANA_SIZE, c]);
+  });
+  return catmull(ctrl, 8);
+}
+const KANA_HEIGHT = KANA.length * KANA_SIZE + (KANA.length - 1) * KANA_GAP;
+
+// ================================================================
+// The cave ceiling: a polyline with x strictly increasing.
+// sh[i] marks sharp points; a segment is sharp when both ends are.
+// Above the line is rock, below is open air.
+// ================================================================
+class Cave {
+  constructor(seed, startX) {
+    this.rand = mulberry32(seed);
+    this.xs = []; this.ys = []; this.sh = [];
+    this.y = CEIL0; this.genX = -400;
+    this.startX = startX;
+    this.push(-400, CEIL0, 0);
+    this.rock(400 + startX + 1000, CEIL0, 0);   // a calm, flat place to begin
+  }
+  push(x, y, s) { this.xs.push(x); this.ys.push(y); this.sh.push(s); this.genX = x; }
+  diff() { return clamp((this.genX - this.startX - 1200) / 36000, 0, 1); }
+  ensure(x) { let guard = 0; while (this.genX < x && guard++ < 64) this.next(); }
+
+  rock(len, target, rough = 1) {
+    const x0 = this.genX, y0 = this.y, n = Math.max(2, Math.round(len / DX));
+    const ph = this.rand() * 100;
+    target = clamp(target, 122, 370);
+    for (let i = 1; i <= n; i++) {
+      const t = i / n, x = x0 + len * t, s = t * t * (3 - 2 * t);
+      const wob = (Math.sin(x * 0.021 + ph) * 6 + Math.sin(x * 0.057 + ph * 2) * 3) * Math.sin(Math.PI * t);
+      this.push(x, lerp(y0, target, s) + rough * wob, 0);
+    }
+    this.y = target;
+  }
+  thorns(len) {
+    const x0 = this.genX, y0 = this.y, n = Math.max(2, Math.round(len / 13)), w = len / n;
+    this.sh[this.sh.length - 1] = 1;
+    for (let i = 0; i < n; i++) {
+      this.push(x0 + w * (i + 0.5), y0 + 12, 1);
+      this.push(x0 + w * (i + 1), y0, 1);
+    }
+  }
+  icicle(h) {
+    const x0 = this.genX, y0 = this.y, w = 20 + h * 0.09;
+    this.sh[this.sh.length - 1] = 1;
+    this.push(x0 + w * 0.5, y0 + h, 1);
+    this.push(x0 + w, y0, 1);
+  }
+  next() {
+    const r = this.rand, D = this.diff(), y = this.y;
+    const roll = r();
+    if (roll < 0.26 - D * 0.1) {                       // plain rock, the ceiling wanders
+      this.rock(240 + r() * 320, lerp(140, 190 + 130 * D, r()));
+    } else if (roll < 0.56) {                          // a field of thorns: fly over it
+      this.rock(110 + r() * 90, y + (r() - 0.5) * 50);
+      this.thorns(70 + r() * (90 + 330 * D));
+      this.rock(150 + r() * 120, this.y + (r() - 0.5) * 60);
+    } else if (roll < 0.78) {                          // icicles hanging into the way
+      const n = 1 + Math.floor(r() * (1.5 + 3 * D));
+      for (let i = 0; i < n; i++) {
+        this.rock(110 + r() * (190 - 70 * D), this.y + (r() - 0.5) * 40);
+        this.icicle(50 + r() * (60 + 190 * D));
+      }
+      this.rock(150 + r() * 80, this.y);
+    } else if (roll < 0.89) {                          // a high vault: long ropes, long falls
+      this.rock(160 + r() * 120, 122 + r() * 20);
+      this.rock(200 + r() * 200 * (0.5 + D), 122 + r() * 30);
+      this.rock(160 + r() * 100, 160 + r() * 50);
+    } else {                                           // a low passage, maybe barbed
+      const low = 290 + r() * (40 + 50 * D);
+      this.rock(160 + r() * 80, low);
+      if (r() < 0.3 + 0.6 * D) { this.thorns(60 + r() * (60 + 150 * D)); }
+      else this.rock(80 + r() * 120, low + (r() - 0.5) * 20);
+      this.rock(180 + r() * 80, 150 + r() * 60);
+    }
+  }
+  idx(x) {
+    const xs = this.xs; let lo = 0, hi = xs.length - 1;
+    if (x <= xs[0]) return 0;
+    if (x >= xs[hi]) return hi - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (xs[m] <= x) lo = m; else hi = m; }
+    return lo;
+  }
+  yAt(x) {
+    const i = this.idx(x), x0 = this.xs[i], x1 = this.xs[i + 1];
+    return lerp(this.ys[i], this.ys[i + 1], clamp((x - x0) / (x1 - x0), 0, 1));
+  }
+  segSharp(i) { return this.sh[i] && this.sh[i + 1]; }
+  // first hit of the segment o + d·t (t ∈ [0, L]) with the ceiling
+  raycast(ox, oy, dx, dy, L) {
+    const xa = Math.min(ox, ox + dx * L), xb = Math.max(ox, ox + dx * L);
+    const i0 = this.idx(xa), i1 = Math.min(this.idx(xb) + 1, this.xs.length - 2);
+    let best = Infinity, bi = -1;
+    for (let i = i0; i <= i1; i++) {
+      const ax = this.xs[i], ay = this.ys[i], ex = this.xs[i + 1] - ax, ey = this.ys[i + 1] - ay;
+      const den = dx * ey - dy * ex;
+      if (Math.abs(den) < 1e-9) continue;
+      const qx = ax - ox, qy = ay - oy;
+      const t = (qx * ey - qy * ex) / den, u = (qx * dy - qy * dx) / den;
+      if (t >= 0 && t <= L && u >= 0 && u <= 1 && t < best) { best = t; bi = i; }
+    }
+    if (bi < 0) return null;
+    return { t: best, x: ox + dx * best, y: oy + dy * best, sharp: this.segSharp(bi) };
+  }
+  // deepest contact of a circle with the ceiling, or null
+  collide(cx, cy, r) {
+    const i0 = this.idx(cx - r - 40), i1 = Math.min(this.idx(cx + r + 40) + 1, this.xs.length - 2);
+    let res = null, sharp = false;
+    for (let i = i0; i <= i1; i++) {
+      const ax = this.xs[i], ay = this.ys[i], bx = this.xs[i + 1], by = this.ys[i + 1];
+      const ex = bx - ax, ey = by - ay, l2 = ex * ex + ey * ey;
+      const u = l2 > 0 ? clamp(((cx - ax) * ex + (cy - ay) * ey) / l2, 0, 1) : 0;
+      const px = ax + ex * u, py = ay + ey * u;
+      const ddx = cx - px, ddy = cy - py, d = Math.hypot(ddx, ddy);
+      if (d < r) {
+        if (this.segSharp(i) && d < r * 0.85) sharp = true;
+        const pen = r - d;
+        if (!res || pen > res.pen) res = { nx: d > 1e-6 ? ddx / d : 0, ny: d > 1e-6 ? ddy / d : 1, pen };
+      }
+    }
+    const yc = this.yAt(cx);
+    if (cy < yc) {                       // the centre got inside the rock
+      const i = this.idx(cx);
+      if (this.segSharp(i)) sharp = true;
+      res = { nx: 0, ny: 1, pen: yc - cy + r };
+    }
+    if (res) res.sharp = sharp;
+    return res;
+  }
+}
+
+// ================================================================
+// state
+// ================================================================
+const view = { w: 960, h: 600, scale: 1, dpr: 1 };
+const cam = { x: 0, y: 0 };
+let run = null;
+let state = 'title';          // title → play → dying → ready → play …
+let stateT = 0;
+let intro = 0;                // the first drawing of the line, 0…1
+let wipe = null;              // between scenes the line winds back to its start, then draws the next
+let last = null;              // { score, newBest } of the previous run
+let best = 0;
+try { best = Math.max(0, parseInt(localStorage.getItem('hitosuji-best'), 10) || 0); } catch (e) { /* private mode */ }
+function saveBest() { try { localStorage.setItem('hitosuji-best', String(best)); } catch (e) { /* ignore */ } }
+
+const TITLE_TOP = CEIL0 + 34;
+const TITLE_LEN = TITLE_TOP + KANA_HEIGHT + 36 + 13 - CEIL0;   // anchor → spider centre
+
+function newRun(withTitle, seed) {
+  if (seed == null) seed = (Math.random() * 2147483647) | 0;
+  const startX = 400;
+  const len = withTitle ? TITLE_LEN : 220;
+  run = {
+    cave: new Cave(seed, startX), seed, startX,
+    s: { x: startX, y: CEIL0 + len, vx: 0, vy: 0, att: true, px: startX, py: CEIL0, len,
+         ux: 0, uy: -1, spread: 0, curl: 0 },
+    shot: null, drag: null, snaps: [], wob: 9,
+    maxX: startX, score: 0, marks: 0, bestAtStart: best, passedBest: false,
+    title: withTitle ? 1 : 0, leave: 0, t: 0,
+  };
+  cam.x = startX - view.w * (withTitle ? 0.5 : 0.32);
+}
+
+function spinneret(s) { return [s.x + s.ux * 13, s.y + s.uy * 13]; }
+
+function startPlay() {
+  state = 'play'; stateT = 0;
+  const s = run.s;
+  s.att = true; s.vx = TUNE.KICK; s.vy = 0;
+  run.wob = 0;
+  sfx.pluck(s.len);
+}
+
+// The target is decided the moment you press; the thread then flies there.
+function shoot() {
+  const R = run, s = R.s, a = TUNE.ANGLE * DEG, dx = Math.cos(a), dy = -Math.sin(a);
+  const hit = R.cave.raycast(s.x, s.y, dx, dy, ROPE_MAX);
+  R.shot = { mode: 'out', len: 0, t: 0, dx, dy, hit, dist: hit ? hit.t : ROPE_MAX };
+}
+
+function attach(hit) {
+  const R = run, s = R.s;
+  if (R.drag) {
+    const [ex, ey] = spinneret(s);
+    R.snaps.push({ ax: R.drag.ax, ex, ey, t: 0 });
+    R.drag = null;
+  }
+  s.att = true; s.px = hit.x; s.py = hit.y;
+  s.len = Math.max(ROPE_MIN, Math.hypot(hit.x - s.x, hit.y - s.y));
+  R.shot = null; R.wob = 0;
+  sfx.pluck(s.len);
+}
+
+function letGo() {
+  const R = run, s = R.s;
+  if (s.att) { s.att = false; R.drag = { ax: s.px }; }
+  if (R.shot && R.shot.mode === 'out') { R.shot.mode = 'back'; R.shot.t = 0; }
+}
+
+function die(cause) {
+  const R = run, s = R.s;
+  state = 'dying'; stateT = 0; R.cause = cause;
+  letGo();
+  if (cause === 'thorn') { s.vx *= 0.25; s.vy = Math.min(s.vy, 0) * 0.3 - 140; }
+  sfx.die(cause);
+  const score = R.score, nb = score > best;
+  if (nb) { best = score; saveBest(); }
+  last = { score, newBest: nb };
+  liveText(nb ? `${score} 点。自己ベスト更新。` : `${score} 点。ベストは ${best} 点。`);
+}
+
+function toReady() {
+  captureOld();
+  newRun(false);
+  state = 'ready'; stateT = 0;
+  wipe = { phase: 'out', t: 0 };
+}
+const WIPE_OUT = 0.55, WIPE_IN = 1.1;
+
+function stepShot(dt) {
+  const R = run, s = R.s, sh = R.shot;
+  sh.t += dt;
+  if (sh.mode === 'out') {
+    sh.len = Math.min(sh.dist, sh.len + SHOT_SPEED * dt);
+    if (sh.len >= sh.dist) {
+      const hit = sh.hit;
+      if (!hit) { sh.mode = 'back'; sh.t = 0; }
+      else if (hit.sharp) {
+        sh.mode = 'cut'; sh.t = 0; sh.len = Math.hypot(hit.x - s.x, hit.y - s.y);
+        sh.dx = (hit.x - s.x) / sh.len; sh.dy = (hit.y - s.y) / sh.len; sfx.cut();
+      } else attach(hit);
+    }
+  } else if (sh.t > 0.24) R.shot = null;
+}
+
+// one fixed physics step
+function stepPhys(dt) {
+  const R = run, s = R.s, cave = R.cave;
+  R.t += dt;
+  if (R.shot) stepShot(dt);
+  if (state !== 'play' && state !== 'dying') return;
+
+  s.vy += TUNE.G * dt;
+  if (s.att && state === 'play' && s.vx > 0) {
+    // kicking forward along the swing
+    const dx = s.x - s.px, dy = s.y - s.py, d = Math.hypot(dx, dy) || 1;
+    let tx = -dy / d, ty = dx / d;
+    if (tx < 0) { tx = -tx; ty = -ty; }
+    s.vx += tx * TUNE.PUMP * dt; s.vy += ty * TUNE.PUMP * dt;
+  }
+  const sp = Math.hypot(s.vx, s.vy);
+  if (sp > 0) {
+    const k = Math.min(0.5, TUNE.DRAG * sp * dt);
+    s.vx -= s.vx * k; s.vy -= s.vy * k;
+    if (sp > TUNE.VMAX) { s.vx *= TUNE.VMAX / sp; s.vy *= TUNE.VMAX / sp; }
+  }
+  const prevLen = s.len;
+  if (s.att) s.len = Math.max(ROPE_MIN, s.len - TUNE.REEL * dt);
+  s.x += s.vx * dt; s.y += s.vy * dt;
+  if (s.att) {
+    const dx = s.x - s.px, dy = s.y - s.py, d = Math.hypot(dx, dy);
+    if (d > s.len) {
+      const nx = dx / d, ny = dy / d, tx = -ny, ty = nx;
+      s.x = s.px + nx * s.len; s.y = s.py + ny * s.len;
+      let vr = s.vx * nx + s.vy * ny, vt = s.vx * tx + s.vy * ty;
+      if (vr > 0) vr = 0;
+      vt *= prevLen / s.len;              // climbing the thread spins you faster
+      s.vx = vr * nx + vt * tx; s.vy = vr * ny + vt * ty;
+    }
+  }
+  if (state === 'play') {
+    const c = cave.collide(s.x, s.y, BODY_R);
+    if (c) {
+      if (c.sharp) { die('thorn'); return; }
+      s.x += c.nx * c.pen; s.y += c.ny * c.pen;
+      const vn = s.vx * c.nx + s.vy * c.ny;
+      if (vn < 0) {
+        s.vx -= 1.3 * vn * c.nx; s.vy -= 1.3 * vn * c.ny;
+        if (vn < -150) sfx.tap();
+      }
+    }
+    if (s.y > cam.y + view.h + 70) { die('fall'); return; }
+    if (s.x > R.maxX) R.maxX = s.x;
+  }
+}
+
+// per-frame bookkeeping
+function update(dt) {
+  stateT += dt;
+  if (state === 'title' && intro < 1) intro = Math.min(1, intro + dt / 3.4);
+  if (wipe) {
+    wipe.t += dt;
+    if (wipe.phase === 'out' && wipe.t >= WIPE_OUT * (reduceMotion ? 0.3 : 1)) { wipe.phase = 'in'; wipe.t = 0; }
+    else if (wipe.phase === 'in' && wipe.t >= WIPE_IN * (reduceMotion ? 0.3 : 1)) wipe = null;
+  }
+  const R = run, s = R.s;
+
+  if (state === 'play' || state === 'dying') {
+    acc += dt;
+    let guard = 0;
+    while (acc >= STEP && guard++ < 40) {
+      stepPhys(STEP); acc -= STEP;
+      if (state !== 'play' && state !== 'dying') break;
+    }
+  } else {
+    acc = 0;
+    R.t += dt;
+    const a = 0.012 * Math.sin(R.t * 1.7);            // hanging, barely swaying
+    s.x = s.px + Math.sin(a) * s.len; s.y = s.py + Math.cos(a) * s.len;
+  }
+  R.wob += dt;
+  for (const sn of R.snaps) sn.t += dt;
+  if (R.snaps.length && R.snaps[0].t > 0.32) R.snaps = R.snaps.filter(sn => sn.t <= 0.32);
+
+  if (state !== 'title' && state !== 'ready') {
+    R.title = Math.max(0, R.title - dt / 0.55);
+    R.leave = Math.min(1, R.leave + dt / 0.4);
+  }
+  // spider pose
+  let tx = 0, ty = -1;
+  if (s.att || state === 'title' || state === 'ready') { tx = s.px - s.x; ty = s.py - s.y; }
+  else if (R.drag) { tx = R.drag.ax - s.x; ty = R.cave.yAt(R.drag.ax) - s.y; }
+  const tl = Math.hypot(tx, ty) || 1;
+  const kk = 1 - Math.exp(-dt * 16);
+  s.ux += (tx / tl - s.ux) * kk; s.uy += (ty / tl - s.uy) * kk;
+  const ul = Math.hypot(s.ux, s.uy) || 1; s.ux /= ul; s.uy /= ul;
+  s.spread += ((state === 'play' && !s.att ? 1 : 0) - s.spread) * (1 - Math.exp(-dt * 8));
+  s.curl += ((state === 'dying' ? 1 : 0) - s.curl) * (1 - Math.exp(-dt * 10));
+
+  if (state === 'play') {
+    R.cave.ensure(Math.max(cam.x + view.w, s.x) + 700);
+    R.score = Math.max(0, Math.floor((R.maxX - R.startX) / UNIT));
+    const m = Math.floor(R.score / MARK_EVERY);
+    if (m > R.marks) { R.marks = m; sfx.chime(); }
+    if (!R.passedBest && R.bestAtStart > 0 && R.score > R.bestAtStart) { R.passedBest = true; sfx.chime(true); }
+  }
+  if (state === 'dying' && stateT > 0.95) toReady();
+  updateCam(dt);
+}
+
+function updateCam(dt) {
+  const R = run, s = R.s;
+  if (state === 'dying') return;
+  let target;
+  if (state === 'title') target = R.startX - view.w * 0.5;
+  else if (state === 'ready') target = R.startX - view.w * 0.32;
+  else {
+    target = s.x - view.w * (view.w < 760 ? 0.2 : 0.3) + clamp(s.vx, -200, 600) * 0.12;
+    if (s.att) target = Math.min(target, s.px - 28);          // keep the thread's anchor on screen
+    target = Math.max(target, s.x - view.w + 70);
+  }
+  cam.x += (target - cam.x) * (1 - Math.exp(-dt * (state === 'play' ? 7 : 5)));
+}
+
+// ---------- input ----------
+let acc = 0;
+const pointers = new Set();
+let keyHeld = false;
+function isHeld() { return pointers.size > 0 || keyHeld; }
+function onPress() {
+  sfx.init();
+  if (state === 'title' && intro < 1) { intro = 1; return; }
+  if (state === 'title' || state === 'ready') {
+    if (wipe) { wipe = null; return; }        // finish the drawing first
+    startPlay();
+    return;
+  }
+  if (state === 'play' && !run.s.att) shoot();
+}
+function onRelease() { if (state === 'play') letGo(); }
+
+// ================================================================
+// drawing: build ONE polyline for the whole scene
+// ================================================================
+class Pen {
+  constructor() { this.n = 0; this.cap = 0; this.grow(4096); }
+  grow(c) {
+    const ox = this.x, oy = this.y, or = this.r;
+    this.cap = c; this.x = new Float32Array(c); this.y = new Float32Array(c); this.r = new Uint8Array(c);
+    if (ox) { this.x.set(ox); this.y.set(oy); this.r.set(or); }
+  }
+  reset() { this.n = 0; }
+  add(x, y, r = 0) {
+    if (this.n >= this.cap) this.grow(this.cap * 2);
+    this.x[this.n] = x; this.y[this.n] = y; this.r[this.n] = r; this.n++;
+  }
+}
+const pen = new Pen();
+
+// Branches hang off the ceiling. pts = flat [x, y, …] starting at the anchor.
+// Open branches are drawn out and then back along themselves.
+function emitBranch(P, a) {
+  const p = a.pts, n = p.length;
+  P.add(p[0], p[1]);
+  const rf = a.rf == null ? n : a.rf;
+  for (let i = 2; i < n; i += 2) P.add(p[i], p[i + 1], i >= rf ? 1 : 0);
+  if (!a.closed) for (let i = n - 4; i >= 0; i -= 2) P.add(p[i], p[i + 1], 1);
+}
+function walkCeiling(P, cave, x0, x1, atts) {
+  atts.sort((a, b) => a.x - b.x);
+  let k = 0;
+  const upTo = x => { while (k < atts.length && atts[k].x <= x) emitBranch(P, atts[k++]); };
+  P.add(x0, cave.yAt(x0));
+  upTo(x0);
+  for (let i = cave.idx(x0) + 1; i < cave.xs.length && cave.xs[i] < x1; i++) {
+    upTo(cave.xs[i]);
+    P.add(cave.xs[i], cave.ys[i]);
+  }
+  upTo(x1);
+  P.add(x1, cave.yAt(x1));
+  while (k < atts.length) emitBranch(P, atts[k++]);
+}
+
+function ropePts(out, ax, ay, ex, ey, wob) {
+  const dx = ex - ax, dy = ey - ay, L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+  const amp = !reduceMotion && wob < 0.7 ? Math.min(7, L * 0.04) * Math.exp(-wob / 0.13) : 0;
+  const n = amp > 0.05 ? 18 : 1;
+  for (let i = 1; i <= n; i++) {
+    const u = i / n, o = amp * Math.sin(Math.PI * u) * Math.cos(wob * 70);
+    out.push(ax + dx * u + nx * o, ay + dy * u + ny * o);
+  }
+}
+function slackPts(out, ax, ay, ex, ey, sagK) {
+  const L = Math.hypot(ex - ax, ey - ay), sag = clamp(L * sagK, 3, 110);
+  const cx = (ax + ex) / 2, cy = (ay + ey) / 2 + sag, n = clamp(Math.ceil(L / 14), 6, 40);
+  for (let i = 1; i <= n; i++) {
+    const u = i / n, a = (1 - u) * (1 - u), b = 2 * u * (1 - u), c = u * u;
+    out.push(a * ax + b * cx + c * ex, a * ay + b * cy + c * ey);
+  }
+}
+function resampleFlat(p, M) {           // flat [x,y,…] → M evenly spaced points (flat)
+  const n = p.length / 2, cum = new Float32Array(n);
+  for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + Math.hypot(p[2 * i] - p[2 * i - 2], p[2 * i + 1] - p[2 * i - 1]);
+  const total = cum[n - 1], out = new Array(M * 2);
+  let j = 1;
+  for (let k = 0; k < M; k++) {
+    const s = total * k / (M - 1);
+    while (j < n - 1 && cum[j] < s) j++;
+    const s0 = cum[j - 1], s1 = cum[j], u = s1 > s0 ? clamp((s - s0) / (s1 - s0), 0, 1) : 0;
+    out[2 * k] = lerp(p[2 * j - 2], p[2 * j], u); out[2 * k + 1] = lerp(p[2 * j - 1], p[2 * j + 1], u);
+  }
+  return out;
+}
+let kanaCache = null;
+function titleRope(out, ax, ay, tx, ty, k) {
+  if (!kanaCache || kanaCache.ax !== ax) kanaCache = { ax, col: kanaColumn(ax, TITLE_TOP) };
+  const full = [ax, ay];
+  for (const [x, y] of kanaCache.col) full.push(x, y);
+  full.push(tx, ty);
+  if (k >= 0.999) { for (let i = 2; i < full.length; i++) out.push(full[i]); return; }
+  const M = 260, A = resampleFlat(full, M), e = easeInOut(k);
+  for (let i = 1; i < M; i++) {
+    const u = i / (M - 1);
+    out.push(lerp(lerp(ax, tx, u), A[2 * i], e), lerp(lerp(ay, ty, u), A[2 * i + 1], e));
+  }
+}
+
+// the spider: abdomen and head as two loops, eight legs out and back
+const LEG_REL = [44, 74, 108, 140, 220, 252, 286, 316].map(d => d * DEG);
+function legPts(out, hx, hy, hr, ang, li, s, t) {
+  const rel = LEG_REL[li], side = rel < Math.PI ? 1 : -1, k = side > 0 ? li : 7 - li;
+  const a = ang + rel, px = hx + hr * Math.cos(a), py = hy + hr * Math.sin(a);
+  const sp = s.spread, cu = s.curl;
+  const wig = reduceMotion ? 0 : Math.sin(t * 9 + li * 1.9) * 0.1 * (1 - cu);
+  const fa = a + side * ((k - 1.5) * 0.18 * (1 + sp * 0.7) - cu * 0.8) + wig;
+  const L1 = 10 * (1 - cu * 0.3), L2 = (12 + sp * 3) * (1 - cu * 0.4);
+  const kx = px + L1 * Math.cos(fa), ky = py + L1 * Math.sin(fa);
+  const ta = fa + side * (k < 2 ? -1 : 1) * (0.6 - sp * 0.3) - side * cu * 1.4;
+  const fx = kx + L2 * Math.cos(ta), fy = ky + L2 * Math.sin(ta);
+  out.push(px, py, kx, ky, fx, fy, kx, ky, px, py);
+}
+function spiderPts(out, s, t) {
+  const ux = s.ux, uy = s.uy, ang = Math.atan2(uy, ux);
+  const abx = s.x + ux * 5, aby = s.y + uy * 5, abR = 8;
+  const hdx = s.x - ux * 8.5, hdy = s.y - uy * 8.5, hdR = 5.5;
+  for (let i = 1; i <= 10; i++) { const a = ang + Math.PI * i / 10; out.push(abx + abR * Math.cos(a), aby + abR * Math.sin(a)); }
+  let li = 0;
+  for (let i = 1; i <= 24; i++) {
+    const rel = i / 24 * Math.PI * 2;
+    while (li < 8 && LEG_REL[li] <= rel) legPts(out, hdx, hdy, hdR, ang, li++, s, t);
+    out.push(hdx + hdR * Math.cos(ang + rel), hdy + hdR * Math.sin(ang + rel));
+  }
+  for (let i = 1; i <= 10; i++) { const a = ang + Math.PI + Math.PI * i / 10; out.push(abx + abR * Math.cos(a), aby + abR * Math.sin(a)); }
+}
+function shotPts(out, T, s, sh) {
+  if (sh.mode === 'cut') {
+    const k = Math.min(1, sh.t / 0.24), L = sh.len * (1 - easeOut(k));
+    const ex = s.x + sh.dx * L, ey = s.y + sh.dy * L + 70 * k * k;
+    const p = [T[0], T[1]];
+    slackPts(p, T[0], T[1], ex, ey, 0.1 + 0.4 * k);
+    for (let i = 2; i < p.length; i++) out.push(p[i]);
+    for (let i = p.length - 4; i >= 0; i -= 2) out.push(p[i], p[i + 1]);
+    return;
+  }
+  if (sh.mode === 'out' && sh.hit) {
+    const u = clamp(sh.len / sh.dist, 0, 1);
+    out.push(lerp(T[0], sh.hit.x, u), lerp(T[1], sh.hit.y, u), T[0], T[1]);
+    return;
+  }
+  const L = sh.mode === 'out' ? sh.len : sh.len * (1 - easeOut(Math.min(1, sh.t / 0.2)));
+  out.push(s.x + sh.dx * L, s.y + sh.dy * L, T[0], T[1]);
+}
+
+// a milestone post standing on the rock above the ceiling; it folds away near the screen edges
+function postPts(atts, cave, mx, label, x0, x1) {
+  for (let g = 0; g < 12 && cave.segSharp(cave.idx(mx)); g++) mx -= DX;
+  const size = 19, w = textWidth(label, size);
+  const m = clamp((Math.min(mx - x0, x1 - mx) - 6) / (w / 2 + 16), 0, 1);
+  if (m < 0.02) return;
+  const e = easeOut(m), my = cave.yAt(mx), base = lerp(my, 82, e), tw = w * e;
+  const p = [mx, my, mx, base, mx - tw / 2, base];
+  textPts(p, label, mx - tw / 2, base, size * e);
+  atts.push({ x: mx, pts: p });
+}
+
+function signLayout(R) {
+  const str = String(last ? last.score : 0);
+  const left = R.startX + 34 + textWidth('HOLD', 19) + 26, right = R.startX + view.w * 0.68 - 22;
+  const size = clamp((right - left - 40) / textWidth(str, 1), 30, 104);
+  const tw = textWidth(str, size), cx = Math.max(left + tw / 2 + 20, (left + right) / 2);
+  return { str, size, tw, cx, base: clamp(CEIL0 + 90 + size, 280, 450) };
+}
+
+function buildScene() {
+  pen.reset();
+  const R = run, s = R.s, cave = R.cave;
+  const x0 = cam.x - 6, x1 = cam.x + view.w + 6;
+  cave.ensure(x1 + 50);
+  const atts = [];
+  const T = spinneret(s);
+
+  // the spider on its silk
+  const br = [];
+  let ax;
+  if (s.att || state === 'title' || state === 'ready') {
+    ax = s.px; const ay = cave.yAt(ax);
+    br.push(ax, ay);
+    if (R.title > 0) titleRope(br, ax, ay, T[0], T[1], R.title);
+    else ropePts(br, ax, ay, T[0], T[1], R.wob);
+  } else {
+    ax = R.drag ? Math.max(R.drag.ax, x0 + 8) : clamp(s.x, x0 + 8, x1 - 8);
+    const ay = cave.yAt(ax);
+    br.push(ax, ay);
+    slackPts(br, ax, ay, T[0], T[1], 0.1);
+  }
+  spiderPts(br, s, R.t);
+  if (R.shot) shotPts(br, T, s, R.shot);
+  atts.push({ x: ax, pts: br });
+
+  // old draglines springing back to the rock
+  for (const sn of R.snaps) {
+    const u = easeOut(Math.min(1, sn.t / 0.3)), sx = Math.max(sn.ax, x0 + 8), sy = cave.yAt(sx);
+    const p = [sx, sy];
+    slackPts(p, sx, sy, lerp(sn.ex, sx, u), lerp(sn.ey, sy, u), 0.15 + 0.5 * u);
+    atts.push({ x: sx, pts: p });
+  }
+
+  // milestone posts and the post marking your best
+  if (state === 'play' || state === 'dying') {
+    const step = MARK_EVERY * UNIT;
+    const kA = Math.max(1, Math.floor((x0 - R.startX) / step)), kB = Math.floor((x1 - R.startX) / step) + 1;
+    for (let k = kA; k <= kB; k++) {
+      const v = k * MARK_EVERY;
+      if (R.bestAtStart > 0 && Math.abs(v - R.bestAtStart) < MARK_EVERY * 0.4) continue;
+      postPts(atts, cave, R.startX + k * step, String(v), x0, x1);
+    }
+    if (R.bestAtStart > 0) postPts(atts, cave, R.startX + R.bestAtStart * UNIT, 'BEST', x0, x1);
+  }
+
+  // words resting on the calm ceiling before a run
+  const h = 1 - easeInOut(R.leave);
+  if (h > 0.002) {
+    const hs = 19, hx = R.startX + (R.title ? KANA_SIZE + 30 : 34);
+    const p = []; hangPts(p, 'HOLD', hx, CEIL0, hs, h);
+    atts.push({ x: hx, pts: p });
+    if (last && !R.title) {
+      const L = signLayout(R);
+      const base = lerp(L.base, CEIL0, easeInOut(1 - h));   // the sign is drawn up into the rock
+      const a = L.cx - L.tw / 2 - 16, b = L.cx + L.tw / 2 + 16;
+      const q = [a, CEIL0, a, base];
+      textPts(q, L.str, L.cx - L.tw / 2, base, L.size, h);
+      q.push(b, base, b, CEIL0);
+      const rf = q.length; q.push(a, CEIL0);
+      atts.push({ x: a, pts: q, closed: true, rf });
+      const word = last.newBest ? 'NEW BEST' : 'BEST ' + best, ws = 19, ww = textWidth(word, ws);
+      const r = []; textPts(r, word, L.cx - ww / 2, CEIL0, ws, h);
+      atts.push({ x: L.cx - ww / 2, pts: r });
+    } else if (best > 0) {
+      const word = 'BEST ' + best, ws = 19, ww = textWidth(word, ws);
+      const wx = R.startX + Math.min(view.w * 0.3, 330) - ww / 2;
+      const r = []; textPts(r, word, wx, CEIL0, ws, h);
+      atts.push({ x: wx, pts: r });
+    }
+  }
+  walkCeiling(pen, cave, x0, x1, atts);
+}
+
+// ---------- to the canvas: exactly one moveTo and one stroke ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const reduceMotion = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
+let ink = '#1b2e4b';
+function readColors() {
+  const v = getComputedStyle(document.documentElement).getPropertyValue('--thread').trim();
+  if (v) ink = v;
+}
+let SX = new Float32Array(8192), SY = new Float32Array(8192);
+let DXs = new Float32Array(8192), DYs = new Float32Array(8192);
+const stats = { moveTo: 0, stroke: 0, points: 0 };
+
+let OX = new Float32Array(8192), OY = new Float32Array(8192), OR = new Uint8Array(8192), oldN = 0;
+// keep the last full frame (screen space) so it can wind back before the next scene is drawn
+function captureOld() {
+  const n = lastFull.n;
+  if (OX.length < n) { OX = new Float32Array(n * 2); OY = new Float32Array(n * 2); OR = new Uint8Array(n * 2); }
+  const m = 24 * view.dpr, w = canvas.width + m, h = canvas.height + m;
+  for (let i = 0; i < n; i++) { OX[i] = clamp(SX[i], -m, w); OY[i] = clamp(SY[i], -m, h); OR[i] = pen.r[i]; }
+  oldN = n;
+}
+const lastFull = { n: 0 };
+// the first `frac` of the line, measured in visible ink: going back over a stroke costs nothing
+function prefix(X, Y, R, n, frac, outX, outY) {
+  if (n < 2) { outX[0] = X[0]; outY[0] = Y[0]; return n; }
+  let total = 0;
+  for (let i = 1; i < n; i++) if (!R[i]) total += Math.hypot(X[i] - X[i - 1], Y[i] - Y[i - 1]);
+  let left = total * clamp(frac, 0, 1);
+  if (outX.length < n + 1) throw new Error('buffer');
+  outX[0] = X[0]; outY[0] = Y[0];
+  for (let m = 1; m < n; m++) {
+    const seg = R[m] ? 0 : Math.hypot(X[m] - X[m - 1], Y[m] - Y[m - 1]);
+    if (seg >= left && !R[m]) {
+      const u = seg > 0 ? left / seg : 1;
+      outX[m] = lerp(X[m - 1], X[m], u); outY[m] = lerp(Y[m - 1], Y[m], u);
+      return m + 1;
+    }
+    left -= seg;
+    outX[m] = X[m]; outY[m] = Y[m];
+  }
+  return n;
+}
+
+function render() {
+  const n = pen.n;
+  if (SX.length < n) { SX = new Float32Array(n * 2); SY = new Float32Array(n * 2); }
+  const k = view.scale * view.dpr, cx = cam.x, cy = cam.y;
+  for (let i = 0; i < n; i++) { SX[i] = (pen.x[i] - cx) * k; SY[i] = (pen.y[i] - cy) * k; }
+  lastFull.n = n;
+  if (DXs.length < Math.max(n, oldN) + 2) { DXs = new Float32Array((Math.max(n, oldN) + 2) * 2); DYs = new Float32Array(DXs.length); }
+  let X = SX, Y = SY, N = n;
+
+  let frac = 1, src = 'now';
+  if (wipe && wipe.phase === 'out') { frac = 1 - easeInOut(clamp(wipe.t / WIPE_OUT, 0, 1)); src = 'old'; }
+  else if (wipe) frac = easeInOut(clamp(wipe.t / WIPE_IN, 0, 1));
+  else if (state === 'title' && intro < 1) frac = easeInOut(intro);
+  if (src === 'old') { N = prefix(OX, OY, OR, oldN, frac, DXs, DYs); X = DXs; Y = DYs; }
+  else if (frac < 1) { N = prefix(SX, SY, pen.r, n, frac, DXs, DYs); X = DXs; Y = DYs; }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = clamp(view.scale * 1.55, 1.5, 2.6) * view.dpr;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.strokeStyle = ink;
+  stats.moveTo = 0; stats.stroke = 0; stats.points = N;
+  if (N > 0) {
+    ctx.beginPath();
+    ctx.moveTo(X[0], Y[0]); stats.moveTo++;
+    for (let i = 1; i < N; i++) ctx.lineTo(X[i], Y[i]);
+    ctx.stroke(); stats.stroke++;
+  }
+}
+
+// ================================================================
+// sound: every thread you throw is a plucked string (Karplus–Strong),
+// tuned to the miyako-bushi scale; shorter threads sing higher.
+// ================================================================
+const sfx = {
+  ctx: null, out: null, muted: false, bufs: new Map(),
+  init() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      const c = this.ctx = new AC();
+      this.out = c.createGain(); this.out.gain.value = 0.5;
+      const dl = c.createDelay(1), fb = c.createGain(), lp = c.createBiquadFilter(), wet = c.createGain();
+      dl.delayTime.value = 0.21; fb.gain.value = 0.3; lp.type = 'lowpass'; lp.frequency.value = 1700; wet.gain.value = 0.32;
+      this.out.connect(c.destination);
+      this.out.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(wet); wet.connect(c.destination);
+    } catch (e) { this.ctx = null; }
+  },
+  ks(freq, dur, bright) {
+    const key = freq.toFixed(2) + '/' + bright;
+    let b = this.bufs.get(key);
+    if (b) return b;
+    const c = this.ctx, sr = c.sampleRate, N = Math.floor(sr * dur), P = Math.max(2, Math.round(sr / freq));
+    b = c.createBuffer(1, N, sr);
+    const d = b.getChannelData(0), rnd = mulberry32(Math.round(freq * 31));
+    let lp = 0;
+    for (let i = 0; i < P && i < N; i++) { lp += (rnd() * 2 - 1 - lp) * bright; d[i] = lp; }
+    for (let i = P; i < N; i++) d[i] = 0.4985 * (d[i - P] + (i - P - 1 >= 0 ? d[i - P - 1] : 0));
+    const fade = Math.floor(N * 0.1);
+    for (let i = 0; i < fade; i++) d[N - 1 - i] *= i / fade;
+    this.bufs.set(key, b);
+    return b;
+  },
+  noise(dur, decay) {
+    const key = 'n' + dur + '/' + decay;
+    let b = this.bufs.get(key);
+    if (b) return b;
+    const c = this.ctx, N = Math.floor(c.sampleRate * dur);
+    b = c.createBuffer(1, N, c.sampleRate);
+    const d = b.getChannelData(0), rnd = mulberry32(7);
+    for (let i = 0; i < N; i++) d[i] = (rnd() * 2 - 1) * Math.exp(-i / (N * decay));
+    this.bufs.set(key, b);
+    return b;
+  },
+  play(buf, gain, when = 0, rate = 1, hp = 0) {
+    if (!this.ctx || this.muted) return;
+    const c = this.ctx, src = c.createBufferSource(), g = c.createGain();
+    src.buffer = buf; src.playbackRate.value = rate; g.gain.value = gain;
+    if (hp) { const f = c.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp; src.connect(f); f.connect(g); }
+    else src.connect(g);
+    g.connect(this.out);
+    src.start(c.currentTime + when);
+  },
+  note(deg) {
+    const SC = [0, 1, 5, 7, 8];                       // 都節音階
+    return 196 * Math.pow(2, (SC[((deg % 5) + 5) % 5] + 12 * Math.floor(deg / 5)) / 12);
+  },
+  pluck(len) {
+    if (!this.ctx) return;
+    const u = 1 - clamp((len - ROPE_MIN) / (ROPE_MAX - ROPE_MIN), 0, 1);
+    this.play(this.ks(this.note(Math.round(u * 9)), 1.8, 0.55), 0.55);
+  },
+  chime(big) {
+    if (!this.ctx) return;
+    const a = big ? [12, 14, 17] : [10, 12];
+    a.forEach((d, i) => this.play(this.ks(this.note(d), 1.6, 0.7), 0.32, i * 0.09));
+  },
+  cut() { if (this.ctx) this.play(this.noise(0.09, 0.18), 0.35, 0, 1, 2500); },
+  tap() { if (this.ctx) this.play(this.ks(this.note(-5), 0.6, 0.3), 0.25); },
+  die(cause) {
+    if (!this.ctx) return;
+    if (cause === 'thorn') this.play(this.noise(0.12, 0.2), 0.4, 0, 1, 1800);
+    this.play(this.ks(this.note(-3), 2.2, 0.4), 0.5, 0.02);
+    this.play(this.ks(this.note(-5), 2.4, 0.4), 0.42, 0.2);
+  },
+};
+
+// ================================================================
+// input, resize, loop
+// ================================================================
+const KEYS = new Set(['Space', 'ArrowUp', 'Enter', 'KeyW', 'KeyZ', 'KeyX']);
+canvas.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  e.preventDefault();
+  const was = isHeld();
+  pointers.add(e.pointerId);
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* fine */ }
+  if (!was) onPress();
+});
+const pointerUp = e => { if (pointers.delete(e.pointerId) && !isHeld()) onRelease(); };
+canvas.addEventListener('pointerup', pointerUp);
+canvas.addEventListener('pointercancel', pointerUp);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('keydown', e => {
+  if (e.code === 'KeyM') { sfx.muted = !sfx.muted; return; }
+  if (!KEYS.has(e.code)) return;
+  e.preventDefault();
+  if (e.repeat) return;
+  const was = isHeld();
+  keyHeld = true;
+  if (!was) onPress();
+});
+window.addEventListener('keyup', e => {
+  if (!KEYS.has(e.code)) return;
+  keyHeld = false;
+  if (!isHeld()) onRelease();
+});
+window.addEventListener('blur', () => { pointers.clear(); keyHeld = false; onRelease(); });
+
+function liveText(str) { const el = document.getElementById('live'); if (el) el.textContent = str; }
+
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  const W = Math.max(1, r.width), H = Math.max(1, r.height);
+  view.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  canvas.width = Math.round(W * view.dpr); canvas.height = Math.round(H * view.dpr);
+  view.scale = Math.min(H / VIEW_H, W / MIN_VIEW_W);
+  view.w = W / view.scale; view.h = H / view.scale;
+  cam.y = -Math.max(0, view.h - VIEW_H) * 0.4;     // tall screens: give the cave some sky above it
+}
+window.addEventListener('resize', resize);
+if (window.matchMedia) {
+  const mq = matchMedia('(prefers-color-scheme: dark)');
+  if (mq.addEventListener) mq.addEventListener('change', readColors);
+}
+new MutationObserver(readColors).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });
+
+let lastNow = 0, running = false, paused = false;
+function frame(now) {
+  const dt = lastNow ? Math.min(0.05, (now - lastNow) / 1000) : 0;
+  lastNow = now;
+  if (!paused) update(dt);
+  buildScene();
+  render();
+  requestAnimationFrame(frame);
+}
+function boot(data) {
+  if (data && +data.best > best) best = +data.best;
+  readColors();
+  resize();
+  newRun(true);
+  if (reduceMotion) intro = 1;
+  if (!running) { running = true; requestAnimationFrame(frame); }
+}
+
+// hooks for tests and for live updates in the artifact viewer
+window.hitosuji = {
+  get state() { return state; }, get run() { return run; }, get view() { return view; },
+  get cam() { return cam; }, get best() { return best; }, get stats() { return stats; },
+  get intro() { return intro; }, set intro(v) { intro = v; },
+  press() { keyHeld = true; onPress(); }, release() { keyHeld = false; onRelease(); },
+  newRun, update, buildScene, render, resize, pen, sfx, GLYPH, TUNE,
+  pause(v) { paused = !!v; },
+  begin(seed) { newRun(false, seed); state = 'ready'; wipe = null; intro = 1; startPlay(); },
+  get wipe() { return wipe; },
+};
+const hot = window.claude && window.claude.hot;
+if (hot && typeof hot.snapshot === 'function') { try { hot.snapshot(() => ({ best })); } catch (e) { /* optional */ } }
+if (hot && typeof hot.ready === 'function') hot.ready(boot);
+else boot((hot && hot.data) || {});
+})();
+</script>
+</body>
+</html>
