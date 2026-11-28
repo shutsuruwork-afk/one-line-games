@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ウラオモテ</title>
+<style>
+  /* Layout: one screen, one canvas, one stroke. Indigo ink on indigo-white paper; the line turns beni-red only when it is cut. */
+  :root { --paper: #e6ebf3; --ink: #1a2750; --beni: #c3303d; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --paper: #0d1530; --ink: #e3e8f4; --beni: #ff6b72; color-scheme: dark; }
+  }
+  :root[data-theme="dark"] { --paper: #0d1530; --ink: #e3e8f4; --beni: #ff6b72; color-scheme: dark; }
+  html { height: 100%; box-sizing: border-box; }
+  body {
+    height: 100%; margin: 0; overflow: hidden;
+    background: var(--paper); color: var(--ink);
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: pointer; }
+  canvas:focus { outline: none; }
+  canvas:focus-visible { outline: 2px dashed var(--ink); outline-offset: -8px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="ウラオモテ。画面は一本の線だけでできています。タップ、クリック、スペースキーで玉が線をくぐって表と裏を入れ替えます。上下の矢印キーで表と裏を直接選べます。線から生えるトゲに当たらないように進んでください。Mキーで消音。"></canvas>
+<p class="sr" id="live" aria-live="polite"></p>
+<script>
+(() => {
+  'use strict';
+
+  const cvs = document.getElementById('c');
+  const ctx = cvs.getContext('2d');
+  const live = document.getElementById('live');
+  const reduceMQ = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  const reduced = () => !!(reduceMQ && reduceMQ.matches);
+  const motionK = () => (reduced() ? 0.5 : 1);
+
+  // ===== World (everything is in world units; the view is at least 640 units wide, 440 on portrait screens) =====
+  const VIEW_H = 300;
+  let PX = 160;              // where the ball sits on the line
+  let vScale = 1;            // narrow views scroll slower so you get the same time to react
+  const R = 13;              // ball radius
+  const HIT = R * 0.72;      // forgiving hit radius
+  const FLIP_T = 0.12;       // seconds for the ball to pass through the line
+  const TOOTH = 24;          // width of one spike
+  const TAU = Math.PI * 2;
+
+  let S = 1, dpr = 1, worldW = 640, worldH = VIEW_H, baseY = VIEW_H / 2, lw = 2.4;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const w = cvs.clientWidth || window.innerWidth;
+    const h = cvs.clientHeight || window.innerHeight;
+    cvs.width = Math.max(1, Math.round(w * dpr));
+    cvs.height = Math.max(1, Math.round(h * dpr));
+    const viewW = w < h ? 440 : 640;
+    S = Math.min(w / viewW, h / VIEW_H);
+    worldW = w / S;
+    worldH = h / S;
+    baseY = worldH * 0.5;
+    PX = Math.round(Math.min(170, Math.max(110, worldW * 0.25)));
+    vScale = Math.min(1, Math.max(0.7, worldW / 640));
+    lw = Math.min(4.6, Math.max(1.7, 2.4 * S)) / S;
+  }
+
+  // ===== Colors (read from the CSS tokens so the page follows the theme) =====
+  let paper = '#e6ebf3', ink = [26, 39, 80], beni = [195, 48, 61];
+  function hex(c, fallback) {
+    const m = /^#?([0-9a-f]{6})$/i.exec((c || '').trim());
+    if (!m) return fallback;
+    const n = parseInt(m[1], 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function readColors() {
+    const cs = getComputedStyle(document.documentElement);
+    paper = cs.getPropertyValue('--paper').trim() || paper;
+    ink = hex(cs.getPropertyValue('--ink'), ink);
+    beni = hex(cs.getPropertyValue('--beni'), beni);
+  }
+  const mix = (a, b, t) => 'rgb(' + a.map((v, i) => Math.round(v + (b[i] - v) * t)).join(',') + ')';
+
+  // ===== Small math =====
+  const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  const smooth = (x) => x * x * (3 - 2 * x);
+  const easeIn = (x) => x * x * x;
+
+  // ===== Glyphs: each letter is one stroke that leaves the line and comes back to it =====
+  // Grid: cap height 4, y up from the line. Every path starts and ends on y = 0.
+  const arc = (cx, cy, rx, ry, a0, a1) => {
+    const n = Math.max(2, Math.ceil(Math.abs(a1 - a0) / 12)), out = [];
+    for (let i = 0; i <= n; i++) {
+      const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180;
+      out.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+    }
+    return out;
+  };
+  const path = (...parts) => {
+    const out = [];
+    for (const p of parts) { if (typeof p[0] === 'number') out.push(p); else for (const q of p) out.push(q); }
+    return out;
+  };
+  const GLYPH = {
+    '0': { w: 2, p: arc(1, 2, 1, 2, 270, 630) },
+    '1': { w: 1.2, p: [[0.8, 0], [0.8, 4], [0.1, 3.3], [0.8, 4], [0.8, 0]] },
+    '2': { w: 2, p: path([0, 0], arc(1, 3, 1, 1, -40, 160), arc(1, 3, 1, 1, 160, -40), [0, 0], [2, 0]) },
+    '3': { w: 2, p: path(arc(1, 1, 1, 1, -90, 90), [0.55, 2], [1, 2], arc(1, 3, 0.9, 1, -90, 150), arc(1, 3, 0.9, 1, 150, -90),
+                         arc(1, 1, 1, 1, 90, -155), arc(1, 1, 1, 1, -155, -90)) },
+    '4': { w: 2, p: [[1.5, 0], [1.5, 4], [0, 1.2], [2, 1.2], [1.5, 1.2], [1.5, 0]] },
+    '5': { w: 2, p: path(arc(0.95, 1.2, 1.05, 1.2, -90, 140), [0.25, 4], [1.95, 4], [0.25, 4],
+                         arc(0.95, 1.2, 1.05, 1.2, 140, -150), arc(0.95, 1.2, 1.05, 1.2, -150, -90)) },
+    '6': { w: 2, p: path(arc(1, 1.1, 1, 1.1, 270, 180), [0.25, 2.6], [0.8, 3.6], [1.6, 4], [0.8, 3.6], [0.25, 2.6],
+                         arc(1, 1.1, 1, 1.1, 180, -90)) },
+    '7': { w: 2, p: [[0.7, 0], [2, 4], [0, 4], [2, 4], [0.7, 0]] },
+    '8': { w: 2, p: path(arc(1, 1, 1, 1, -90, 90), arc(1, 3, 0.85, 1, -90, 270), arc(1, 1, 1, 1, 90, 270)) },
+    '9': { w: 2, p: path([1.2, 0], [1.85, 1.4], [2, 2.9], arc(1, 2.9, 1, 1.1, 0, 360), [1.85, 1.4], [1.2, 0]) },
+    'O': { w: 2.6, p: arc(1.3, 2, 1.3, 2, 270, 630) },
+    'M': { w: 2.8, p: [[0, 0], [0, 4], [1.4, 1.5], [2.8, 4], [2.8, 0]] },
+    'T': { w: 2.4, p: [[1.2, 0], [1.2, 4], [0, 4], [2.4, 4], [1.2, 4], [1.2, 0]] },
+    'E': { w: 1.8, p: path(arc(1, 1, 1, 1, 270, 90), arc(1, 3, 1, 1, 270, 40), arc(1, 3, 1, 1, 40, 270),
+                           arc(1, 1, 1, 1, 90, 270), arc(1, 1, 1, 1, 270, 320), arc(1, 1, 1, 1, 320, 270)) },
+    'U': { w: 2.6, p: path(arc(1.3, 1.3, 1.3, 1.3, 270, 180), [0, 4], [0, 1.3], arc(1.3, 1.3, 1.3, 1.3, 180, 360),
+                           [2.6, 4], [2.6, 1.3], arc(1.3, 1.3, 1.3, 1.3, 360, 270)) },
+    'R': { w: 2.4, p: path([0, 0], [0, 4], [1.2, 4], arc(1.2, 3, 1, 1, 90, -90), [0, 2], [1.0, 2], [2.4, 0]) },
+    'A': { w: 2.6, p: [[0, 0], [1.3, 4], [2.6, 0], [2.08, 1.6], [0.52, 1.6], [2.08, 1.6], [2.6, 0]] },
+    'P': { w: 2.2, p: path([0, 0], [0, 4], [1.2, 4], arc(1.2, 3, 1, 1, 90, -90), [0, 2], [0, 0]) },
+    'B': { w: 2.3, p: path([0, 0], [0, 4], [1.1, 4], arc(1.1, 3, 1, 1, 90, -90), [0, 2], [1.2, 2], arc(1.2, 1, 1.05, 1, 90, -90)) },
+    'S': { w: 2, p: path(arc(1, 1, 1, 1, 270, 450), arc(1, 3, 1, 1, 270, 30), arc(1, 3, 1, 1, 30, 270),
+                         arc(1, 1, 1, 1, 450, 270), arc(1, 1, 1, 1, 270, 210), arc(1, 1, 1, 1, 210, 270)) },
+    ' ': { w: 1.1, p: [] },
+  };
+  const SP = 0.9; // letter spacing, in grid units
+  function textWidth(str) {
+    let w = 0;
+    for (let i = 0; i < str.length; i++) w += (GLYPH[str[i]] ? GLYPH[str[i]].w : 1.1) + (i < str.length - 1 ? SP : 0);
+    return w;
+  }
+
+  // ===== The line is a string: a damped 1D wave equation with fixed ends =====
+  const WN = 128, WK = 26000, WDAMP = 2.4, SAG = 2.2;
+  const wu = new Float32Array(WN), wv = new Float32Array(WN), wf = new Float32Array(WN);
+  const nodeOf = (x) => x / worldW * (WN - 1);
+  function waveAt(x) {
+    const f = nodeOf(x);
+    if (!(f > 0 && f < WN - 1)) return 0;
+    const i = f | 0, t = f - i;
+    return wu[i] + (wu[i + 1] - wu[i]) * t;
+  }
+  function pluck(x, amp, width) {
+    width = width || 2.4;
+    const c = nodeOf(x);
+    const i0 = Math.max(1, Math.floor(c - width * 3)), i1 = Math.min(WN - 2, Math.ceil(c + width * 3));
+    for (let i = i0; i <= i1; i++) { const d = (i - c) / width; wv[i] += amp * Math.exp(-d * d); }
+  }
+  // The ball's weight bends the string toward the side it is on.
+  function setLoad(x, sag) {
+    wf.fill(0);
+    if (Math.abs(sag) < 1e-3) return;
+    const L = WN - 1, a = nodeOf(x);
+    if (a <= 1 || a >= L - 1) return;
+    const total = sag * WK * L / (a * (L - a));
+    let sum = 0;
+    for (let i = 1; i < WN - 1; i++) { const d = (i - a) / 1.6; const w = d * d < 12 ? Math.exp(-d * d) : 0; wf[i] = w; sum += w; }
+    if (sum > 0) for (let i = 1; i < WN - 1; i++) wf[i] *= total / sum;
+  }
+  function waveStep(dt) {
+    const sub = Math.max(1, Math.ceil(dt * 240)), h = dt / sub;
+    for (let s = 0; s < sub; s++) {
+      for (let i = 1; i < WN - 1; i++) wv[i] += (WK * (wu[i - 1] + wu[i + 1] - 2 * wu[i]) - WDAMP * wv[i] + wf[i]) * h;
+      for (let i = 1; i < WN - 1; i++) wu[i] += wv[i] * h;
+    }
+  }
+
+  // ===== Sound: plucked-string tones (Karplus-Strong) =====
+  let actx = null, master = null, muted = false;
+  const bufCache = new Map();
+  function unlockAudio() {
+    if (!actx) {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        actx = new AC();
+        master = actx.createGain();
+        master.gain.value = 0.5;
+        master.connect(actx.destination);
+      } catch (e) { actx = null; return; }
+    }
+    if (actx.state === 'suspended') actx.resume().catch(() => {});
+  }
+  function stringBuf(freq) {
+    const key = Math.round(freq * 100);
+    let buf = bufCache.get(key);
+    if (buf) return buf;
+    const sr = actx.sampleRate, len = Math.floor(sr * 1.6), N = Math.max(2, Math.round(sr / freq));
+    buf = actx.createBuffer(1, len, sr);
+    const d = buf.getChannelData(0);
+    let lp = 0, mean = 0;
+    for (let i = 0; i < N && i < len; i++) { lp += 0.55 * ((Math.random() * 2 - 1) - lp); d[i] = lp; mean += lp; }
+    mean /= N;
+    for (let i = 0; i < N && i < len; i++) d[i] -= mean;
+    for (let i = N; i < len; i++) d[i] = 0.4985 * (d[i - N] + d[i - N + 1]);
+    const fade = Math.floor(sr * 0.2);
+    for (let i = 0; i < fade; i++) d[len - 1 - i] *= i / fade;
+    bufCache.set(key, buf);
+    return buf;
+  }
+  function pluckSnd(freq, vol, when, bend) {
+    if (!actx || muted) return;
+    const t = actx.currentTime + (when || 0);
+    const src = actx.createBufferSource();
+    src.buffer = stringBuf(freq);
+    const g = actx.createGain();
+    g.gain.value = vol;
+    if (bend) {
+      src.playbackRate.setValueAtTime(1, t);
+      src.playbackRate.exponentialRampToValueAtTime(bend, t + 0.6);
+    }
+    src.connect(g); g.connect(master);
+    src.start(t);
+  }
+  function noiseSnd(vol) {
+    if (!actx || muted) return;
+    const sr = actx.sampleRate, len = Math.floor(sr * 0.14);
+    const buf = actx.createBuffer(1, len, sr), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+    const src = actx.createBufferSource(); src.buffer = buf;
+    const f = actx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 1800;
+    const g = actx.createGain(); g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(master);
+    src.start();
+  }
+  const PENTA = [0, 3, 5, 7, 10];
+  const note = (i) => 196 * Math.pow(2, (12 * Math.floor(i / 5) + PENTA[((i % 5) + 5) % 5]) / 12);
+  const pitchStep = () => Math.min(10, Math.floor(score / 6));
+
+  // ===== Game state =====
+  let state = 'title', stT = 0, T = 0;
+  let score = 0, best = loadBest(), newBest = false, celebrate = 0;
+  let dist = 0, ballPos = 1, ballTarget = 1, ballR = R, rollA = 0, demoT = 0;
+  let flash = 0, shake = 0, gH = 1, timeScale = 1, cx = 400;
+  let obs = [], lastEnd = 0, lastSide = 0;
+
+  function loadBest() { try { return parseInt(localStorage.getItem('uraomote.best'), 10) || 0; } catch (e) { return 0; } }
+  function saveBest() { try { localStorage.setItem('uraomote.best', String(best)); } catch (e) { /* storage unavailable */ } }
+  function setState(s) { state = s; stT = 0; }
+
+  // ===== Obstacles =====
+  const speedAt = (s) => Math.min(560, 255 + s * 6) * vScale;
+  const slackAt = (s) => Math.max(0.13, 0.27 - s * 0.0035);
+  // The shortest gap that still lets you clear one spike and cross over before the next one on the other side.
+  const minGap = (s) => 2 * HIT + speedAt(s) * (FLIP_T + slackAt(s));
+
+  function place(side, n, gap, kind) {
+    const need = lastSide !== 0 && side !== lastSide ? minGap(score + 3) : 16;
+    const x = lastEnd + Math.max(need, gap);
+    const o = { x, n, tw: TOOTH, w: n * TOOTH, h: 22 + Math.random() * 9, side, sideCur: side, s0: side, kind, flipped: false, passed: false };
+    if (kind === 'flip') { o.s0 = -side; o.sideCur = -side; }
+    obs.push(o);
+    lastEnd = x + o.w;
+    lastSide = side;
+  }
+  function genPattern() {
+    const d = score, mg = minGap(score + 3);
+    const next = () => (lastSide === 0 ? (Math.random() < 0.5 ? 1 : -1) : (Math.random() < 0.6 ? -lastSide : lastSide));
+    const lead = mg * (1.3 + Math.random() * (d < 10 ? 1.5 : 0.9));
+    const table = d < 3 ? [1, 0, 0, 0] : d < 8 ? [0.5, 0.5, 0, 0] : d < 16 ? [0.3, 0.3, 0.4, 0] : [0.18, 0.24, 0.38, 0.2];
+    let r = Math.random(), kind = 0;
+    while (kind < 3 && r >= table[kind]) { r -= table[kind]; kind++; }
+    if (kind === 0) {
+      place(next(), 1, lead, 'spike');
+    } else if (kind === 1) {
+      place(next(), 2 + ((Math.random() * (d < 20 ? 2 : 3)) | 0), lead, 'spike');
+    } else if (kind === 2) {
+      let side = next();
+      const k = 3 + ((Math.random() * (d < 25 ? 2 : 3)) | 0);
+      place(side, 1, lead, 'spike');
+      for (let i = 1; i < k; i++) { side = -side; place(side, Math.random() < 0.25 ? 2 : 1, mg * (1.05 + Math.random() * 0.45), 'spike'); }
+    } else {
+      place(next(), Math.random() < 0.3 ? 2 : 1, lead, 'flip');
+    }
+  }
+  function spawn() {
+    let guard = 0;
+    while (lastEnd - dist < worldW + 80 && guard++ < 20) genPattern();
+  }
+  function stepObstacles(dt, v) {
+    const react = Math.max(0.55, 0.9 - score * 0.008);
+    for (const o of obs) {
+      const sx = o.x - dist;
+      if (o.kind === 'flip') {
+        if (!o.flipped) {
+          o.sideCur = o.s0 * (0.82 + 0.18 * Math.sin(T * 26 + o.x));
+          if (sx < PX + HIT + v * react) {
+            o.flipped = true;
+            pluck(sx + o.w / 2, o.side * 160 * motionK());
+            pluckSnd(note(pitchStep() + 9), 0.12);
+          }
+        } else if (o.sideCur !== o.side) {
+          const step = dt / 0.16 * 2;
+          o.sideCur = o.side > 0 ? Math.min(1, o.sideCur + step) : Math.max(-1, o.sideCur - step);
+        }
+      }
+      if (!o.passed && sx + o.w < PX - HIT) { o.passed = true; score++; onScore(); }
+    }
+    while (obs.length && obs[0].x + obs[0].w - dist < -30) obs.shift();
+  }
+
+  function segDist2(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay;
+    const t = clamp01(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1));
+    const ex = ax + t * dx - px, ey = ay + t * dy - py;
+    return ex * ex + ey * ey;
+  }
+  function circleTri(cx_, cy_, r, ax, ay, bx, by, qx, qy) {
+    const s1 = (bx - ax) * (cy_ - ay) - (by - ay) * (cx_ - ax);
+    const s2 = (qx - bx) * (cy_ - by) - (qy - by) * (cx_ - bx);
+    const s3 = (ax - qx) * (cy_ - qy) - (ay - qy) * (cx_ - qx);
+    const neg = s1 < 0 || s2 < 0 || s3 < 0, pos = s1 > 0 || s2 > 0 || s3 > 0;
+    if (!(neg && pos)) return true;
+    const r2 = r * r;
+    return segDist2(cx_, cy_, ax, ay, bx, by) < r2 || segDist2(cx_, cy_, bx, by, qx, qy) < r2 || segDist2(cx_, cy_, qx, qy, ax, ay) < r2;
+  }
+  function collide() {
+    const cy = ballPos * R;
+    for (const o of obs) {
+      const sx = o.x - dist;
+      if (sx > PX + HIT) break;
+      if (sx + o.w < PX - HIT) continue;
+      const hgt = o.h * o.sideCur;
+      if (Math.abs(hgt) < 1) continue;
+      for (let i = 0; i < o.n; i++) {
+        const tx = sx + i * o.tw;
+        if (tx > PX + HIT || tx + o.tw < PX - HIT) continue;
+        if (circleTri(PX, cy, HIT, tx, 0, tx + o.tw / 2, hgt, tx + o.tw, 0)) { die(); return; }
+      }
+    }
+  }
+
+  // ===== Flow =====
+  function startGame() {
+    score = 0; newBest = false; celebrate = 0;
+    obs.length = 0; gH = 1; timeScale = 1; ballR = R;
+    lastEnd = dist + worldW - 60; lastSide = 0;
+    setState('play');
+  }
+  function flip(dir) {
+    const target = dir === 0 ? -ballTarget : dir;
+    if (target === ballTarget) return;
+    ballTarget = target;
+    pluck(PX, target * 340 * motionK());
+    pluckSnd(note(pitchStep() + (target > 0 ? 2 : 0)), 0.32);
+  }
+  function onScore() {
+    pluck(18 + textWidth(String(score)) * 2, 110 * motionK());
+    if (score % 10 === 0) { pluckSnd(note(pitchStep() + 5), 0.16); pluckSnd(note(pitchStep() + 10), 0.12, 0.08); }
+  }
+  function die() {
+    setState('dying');
+    flash = 1;
+    shake = 7;
+    pluck(PX, (ballPos >= 0 ? -1 : 1) * 1900 * motionK(), 3);
+    pluckSnd(note(-5), 0.7, 0, 0.5);
+    noiseSnd(0.35);
+    try { if (navigator.vibrate) navigator.vibrate(40); } catch (e) { /* not supported */ }
+  }
+  function enterOver() {
+    newBest = score > best && score > 0;
+    if (newBest) {
+      best = score;
+      saveBest();
+      for (let i = 0; i < 4; i++) pluckSnd(note(5 + i * 2), 0.22, 0.25 + i * 0.1);
+    }
+    setState('over');
+    ballR = 0; ballPos = ballTarget = 1;
+    live.textContent = 'スコア ' + score + '。ベスト ' + best + '。';
+  }
+  function press(dir) {
+    unlockAudio();
+    if (state === 'title') startGame();
+    else if (state === 'play') flip(dir);
+    else if (state === 'over') { if (stT > 0.55) startGame(); }
+    else if (state === 'paused') { setState('play'); timeScale = 0; ballR = R; }
+  }
+  function pauseIfPlaying() { if (state === 'play') setState('paused'); }
+
+  // ===== Labels: words the line writes on itself =====
+  const mk = () => ({ text: '', x: 0, anchor: 'center', cap: 16, mirror: false, m: 0, target: 0 });
+  const LB = { omote: mk(), ura: mk(), tap: mk(), bestL: mk(), score: mk(), big: mk(), bestR: mk() };
+  function layout() {
+    cx = PX + (worldW - PX) / 2 + 8;
+    const set = (lb, text, x, anchor, cap, mirror, target) => {
+      if (target > 0 || lb.m <= 0.002) lb.text = text;
+      lb.x = x; lb.anchor = anchor; lb.cap = cap; lb.mirror = mirror; lb.target = target;
+    };
+    const right = worldW - 22;
+    const title = state === 'title', over = state === 'over', playing = !title && !over;
+    set(LB.omote, 'OMOTE', cx, 'center', 40, false, title ? 1 : 0);
+    set(LB.ura, 'URA', cx, 'center', 40, true, title ? 1 : 0);
+    set(LB.tap, 'TAP', right, 'right', 14, false, title ? 0.78 + 0.22 * Math.sin(T * 3.2) : 0);
+    set(LB.bestL, 'BEST ' + best, 18, 'left', 11, false, title && best > 0 ? 1 : 0);
+    set(LB.score, String(score), 18, 'left', 16, false, playing ? 1 : 0);
+    set(LB.big, String(score), cx, 'center', 64, false, over ? 1 : 0);
+    set(LB.bestR, 'BEST ' + best, right, 'right', 13, false, over && stT > 0.3 ? 1 : 0);
+  }
+  function stepLabels(dt) {
+    for (const k in LB) {
+      const lb = LB[k], d = lb.target - lb.m, s = 4.5 * dt;
+      lb.m += d > s ? s : d < -s ? -s : d;
+    }
+  }
+
+  // ===== Update =====
+  function update(dt) {
+    T += dt; stT += dt;
+    const rate = 2 / FLIP_T * dt;
+    if (ballPos < ballTarget) ballPos = Math.min(ballTarget, ballPos + rate);
+    else if (ballPos > ballTarget) ballPos = Math.max(ballTarget, ballPos - rate);
+
+    if (state === 'title') {
+      demoT += dt;
+      if (demoT > 1.7) { demoT = 0; ballTarget = -ballTarget; pluck(PX, ballTarget * 300 * motionK()); }
+      rollA += (ballPos >= 0 ? -1 : 1) * 140 * dt / R;
+    } else if (state === 'play') {
+      timeScale = Math.min(1, timeScale + dt * 1.8);
+      const gdt = dt * timeScale, v = speedAt(score);
+      dist += v * gdt;
+      rollA += (ballPos >= 0 ? -1 : 1) * v * gdt / R;
+      spawn();
+      stepObstacles(gdt, v);
+      collide();
+    } else if (state === 'dying') {
+      ballR = R * (1 - easeIn(Math.min(1, stT / 0.42)));
+      if (stT > 0.85) enterOver();
+    } else if (state === 'over') {
+      gH = Math.max(0, gH - dt * 2.6);
+      if (gH === 0 && obs.length) obs.length = 0;
+      if (stT > 0.3) ballR = Math.min(R, ballR + R * 3 * dt);
+      rollA -= 60 * dt / R;
+      if (newBest && celebrate < 4 && stT > 0.35 + celebrate * 0.42) { celebrate++; pluck(cx, 520 * motionK(), 3); }
+    } else if (state === 'paused') {
+      ballR = R * (0.86 + 0.14 * Math.cos(T * 4));
+    }
+
+    flash = Math.max(0, flash - dt * 1.6);
+    shake = Math.max(0, shake - dt * 18);
+    setLoad(PX, -ballPos * SAG * (ballR / R));
+    waveStep(dt);
+    layout();
+    stepLabels(dt);
+  }
+
+  // ===== Drawing: collect every excursion off the line, then trace it all as ONE path =====
+  function labelItems(lb, items) {
+    if (lb.m <= 0.002 || !lb.text) return;
+    const u = lb.cap / 4, n = lb.text.length, tw = textWidth(lb.text) * u;
+    let x = lb.anchor === 'left' ? lb.x : lb.anchor === 'right' ? lb.x - tw : lb.x - tw / 2;
+    const sgn = lb.mirror ? -1 : 1, st = 0.12;
+    for (let i = 0; i < n; i++) {
+      const g = GLYPH[lb.text[i]];
+      if (g && g.p.length) {
+        const mi = smooth(clamp01(lb.m * (1 + st * (n - 1)) - i * st));
+        if (mi > 0.002) {
+          const pts = g.p.map(([gx, gy]) => { const px = x + gx * u; return [px, sgn * gy * u * mi, px]; });
+          items.push({ x0: pts[0][0], pts });
+        }
+      }
+      x += ((g ? g.w : 1.1) + SP) * u;
+    }
+  }
+  function obstacleItem(o, items) {
+    const sx = o.x - dist;
+    if (sx > worldW + 20 || sx + o.w < -20) return;
+    const pts = [[sx, 0, sx]];
+    let any = false;
+    for (let i = 0; i < o.n; i++) {
+      // each tooth grows out of the line as it enters, and sinks back once it is behind the ball
+      const tx = sx + i * o.tw, mx = tx + o.tw / 2;
+      const k = smooth(Math.min(clamp01((worldW - tx) / 50), clamp01((tx + o.tw - (PX - 55)) / 35))) * gH;
+      if (k > 0.002) any = true;
+      pts.push([mx, o.h * k * o.sideCur, mx], [tx + o.tw, 0, tx + o.tw]);
+    }
+    if (any) items.push({ x0: sx, pts });
+  }
+  function ballItem(items) {
+    const r = ballR;
+    if (r < 0.4) return;
+    const cy = ballPos * r;
+    const a0 = cy >= 0 ? -Math.PI / 2 : Math.PI / 2; // tie the loop to the line at its nearest point
+    const rim = (a) => [PX + r * Math.cos(a), cy + r * Math.sin(a), PX];
+    const sp = (((rollA - a0) % TAU) + TAU) % TAU;
+    const pts = [[PX, 0, PX]];
+    const N = 40;
+    let spoke = false;
+    for (let k = 0; k <= N; k++) {
+      const off = TAU * k / N;
+      if (!spoke && off >= sp) { pts.push(rim(a0 + sp), [PX, cy, PX], rim(a0 + sp)); spoke = true; }
+      pts.push(rim(a0 + off));
+    }
+    pts.push([PX, 0, PX]);
+    items.push({ x0: PX, pts });
+  }
+  function strokePath(items) {
+    items.sort((a, b) => a.x0 - b.x0);
+    let started = false;
+    const emit = (x, yrel, ax) => {
+      const y = baseY - (yrel + waveAt(ax));
+      if (started) ctx.lineTo(x, y); else { ctx.moveTo(x, y); started = true; }
+    };
+    const STEP = 8;
+    const baseTo = (a, b) => { // walk along the line itself, on a fixed grid so retraced parts overlap exactly
+      if (b > a) for (let x = Math.floor(a / STEP) * STEP + STEP; x < b; x += STEP) emit(x, 0, x);
+      else if (b < a) for (let x = Math.ceil(a / STEP) * STEP - STEP; x > b; x -= STEP) emit(x, 0, x);
+      emit(b, 0, b);
+    };
+    ctx.beginPath();
+    emit(-20, 0, -20);
+    let cur = -20;
+    for (const it of items) {
+      baseTo(cur, it.pts[0][0]);
+      for (let i = 1; i < it.pts.length; i++) { const p = it.pts[i]; emit(p[0], p[1], p[2]); }
+      cur = it.pts[it.pts.length - 1][0];
+    }
+    baseTo(cur, worldW + 20);
+    baseTo(worldW + 20, -20); // ride back along the line so it is unbroken under every spike and letter
+    ctx.stroke();
+  }
+  function render() {
+    ctx.setTransform(dpr * S, 0, 0, dpr * S, 0, 0);
+    ctx.fillStyle = paper;
+    ctx.fillRect(-10, -10, worldW + 20, worldH + 20);
+    if (shake > 0.05 && !reduced()) ctx.translate((Math.random() * 2 - 1) * shake, (Math.random() * 2 - 1) * shake);
+    const items = [];
+    for (const k in LB) labelItems(LB[k], items);
+    for (const o of obs) obstacleItem(o, items);
+    ballItem(items);
+    ctx.strokeStyle = mix(ink, beni, flash);
+    ctx.lineWidth = lw;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    strokePath(items);
+  }
+
+  // ===== Input =====
+  window.addEventListener('keydown', (e) => {
+    const keys = { Space: 0, Enter: 0, ArrowUp: 1, KeyW: 1, ArrowDown: -1, KeyS: -1 };
+    if (e.code === 'KeyM' && !e.repeat) { muted = !muted; return; }
+    if (!(e.code in keys)) return;
+    e.preventDefault();
+    if (!e.repeat) press(keys[e.code]);
+  });
+  cvs.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    press(0);
+  });
+  cvs.addEventListener('contextmenu', (e) => e.preventDefault());
+  document.addEventListener('visibilitychange', () => { if (document.hidden) pauseIfPlaying(); });
+  window.addEventListener('blur', pauseIfPlaying);
+  window.addEventListener('resize', resize);
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    if (mq.addEventListener) mq.addEventListener('change', readColors);
+  }
+  if (window.MutationObserver) new MutationObserver(readColors).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });
+
+  // ===== Loop =====
+  let last = 0;
+  function frame(now) {
+    const dt = last ? Math.min(0.033, Math.max(0, (now - last) / 1000)) : 0;
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  function start(data) {
+    if (data && typeof data.best === 'number' && data.best > best) best = data.best;
+    resize();
+    readColors();
+    requestAnimationFrame(frame);
+  }
+  /* test-hook */
+  const hot = window.claude && window.claude.hot;
+  if (hot && typeof hot.snapshot === 'function') { try { hot.snapshot(() => ({ best })); } catch (e) { /* ignore */ } }
+  if (hot && typeof hot.ready === 'function') hot.ready(start); else start((hot && hot.data) || {});
+})();
+</script>
+</body>
+</html>
